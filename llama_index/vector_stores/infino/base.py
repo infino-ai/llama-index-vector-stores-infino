@@ -7,6 +7,7 @@ BM25, hybrid (RRF), and SQL retrieval all run over that one table.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from typing import Any, ClassVar, Literal
 
@@ -46,6 +47,10 @@ DEFAULT_REF_DOC_ID_COLUMN = "ref_doc_id"
 DEFAULT_N_CENT = 64
 # MMR re-embeds candidate texts; over-fetch a wider pool than the final top-k.
 DEFAULT_MMR_FETCH_K = 20
+# When filtering post-rank, over-fetch from the vector TVF and trim after WHERE.
+FILTER_OVERSAMPLE = 10
+
+SearchMode = Literal["or", "and"]
 
 
 class InfinoVectorStore(BasePydanticVectorStore):
@@ -181,7 +186,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         mode = query.mode
         if mode == VectorStoreQueryMode.DEFAULT:
-            return self._vector_query(query)
+            return self._vector_query(query, **kwargs)
         if mode == VectorStoreQueryMode.TEXT_SEARCH:
             return self._text_query(query)
         if mode == VectorStoreQueryMode.HYBRID:
@@ -190,14 +195,85 @@ class InfinoVectorStore(BasePydanticVectorStore):
             return self._mmr_query(query, **kwargs)
         raise NotImplementedError(f"query mode {mode!r} is not supported")
 
-    def _vector_query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
+    async def async_add(
+        self, nodes: Sequence[BaseNode], **kwargs: Any
+    ) -> list[str]:
+        return await asyncio.to_thread(self.add, nodes, **kwargs)
+
+    async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
+        await asyncio.to_thread(self.delete, ref_doc_id, **delete_kwargs)
+
+    async def adelete_nodes(
+        self,
+        node_ids: list[str] | None = None,
+        filters: MetadataFilters | None = None,
+        **delete_kwargs: Any,
+    ) -> None:
+        await asyncio.to_thread(self.delete_nodes, node_ids, filters, **delete_kwargs)
+
+    async def aget_nodes(
+        self,
+        node_ids: list[str] | None = None,
+        filters: MetadataFilters | None = None,
+    ) -> list[BaseNode]:
+        return await asyncio.to_thread(self.get_nodes, node_ids, filters)
+
+    async def aclear(self) -> None:
+        await asyncio.to_thread(self.clear)
+
+    async def aquery(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> VectorStoreQueryResult:
+        return await asyncio.to_thread(self.query, query, **kwargs)
+
+    def search_by_sql(self, sql: str) -> VectorStoreQueryResult:
+        """Run arbitrary SQL and map rows to a ``VectorStoreQueryResult``.
+
+        Project the store's columns (``node_id``, ``ref_doc_id``, the text
+        column, declared metadata, ``_node_content``, ``_node_type``, and
+        optionally ``score``) for full nodes.
+        """
+        return self._to_result(self._safe_query_sql(sql), distance_metric=False)
+
+    def _vector_query(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> VectorStoreQueryResult:
         embedding = _require_embedding(query)
-        result = self._table.vector_search(
-            self._vector_column,
-            embedding,
-            query.similarity_top_k,
-            projection=self._projection(),
-        )
+        filter_query = kwargs.get("filter_query")
+        if query.filters is not None and filter_query is not None:
+            raise ValueError(
+                "use either `query.filters` (structured, post-rank) or "
+                "`filter_query` (text pushdown, pre-rank), not both"
+            )
+        if filter_query is not None:
+            result = self._table.vector_search(
+                self._vector_column,
+                embedding,
+                query.similarity_top_k,
+                filter_column=kwargs.get("filter_column") or self._text_column,
+                filter_query=filter_query,
+                filter_mode=kwargs.get("filter_mode"),
+                projection=self._projection(),
+            )
+        elif query.filters is not None:
+            where = compile_filters(query.filters, self._metadata_column_names)
+            columns = ", ".join(self._projection())
+            sql = (
+                f"SELECT {columns} FROM vector_search("
+                f"{sql_lit(self._table_name)}, {sql_lit(self._vector_column)}, "
+                f"{sql_lit(vector_literal(embedding))}, "
+                f"{query.similarity_top_k * FILTER_OVERSAMPLE}) "
+                f"WHERE {where} ORDER BY {SCORE_COLUMN} ASC "
+                f"LIMIT {query.similarity_top_k}"
+            )
+            result = self._safe_query_sql(sql)
+        else:
+            result = self._table.vector_search(
+                self._vector_column,
+                embedding,
+                query.similarity_top_k,
+                projection=self._projection(),
+            )
         return self._to_result(result, distance_metric=True)
 
     def _text_query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
