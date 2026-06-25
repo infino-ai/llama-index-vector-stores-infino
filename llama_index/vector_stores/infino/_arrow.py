@@ -118,3 +118,11 @@ def is_empty_result_error(exc: BaseException) -> bool:
         return False
     msg = str(exc)
     return any(marker in msg for marker in _EMPTY_RESULT_MARKERS)
+
+
+def is_no_storage_error(exc: BaseException) -> bool:
+    """``memory://`` connections raise this from delete / update; treat as no-op."""
+    return (
+        isinstance(exc, RuntimeError)
+        and "no storage attached" in str(exc)
+    )

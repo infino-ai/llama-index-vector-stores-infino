@@ -21,12 +21,12 @@ type:
 	mypy llama_index
 
 build:
-	python -m pip install --quiet build
-	python -m build
+	python3 -m pip install --quiet build
+	python3 -m build
 
 smoke: build
 	rm -rf .smoke-venv
-	python -m venv .smoke-venv
+	python3 -m venv .smoke-venv
 	.smoke-venv/bin/pip install --quiet "$$(ls dist/*.whl)" pytest pytest-asyncio
 	.smoke-venv/bin/pytest tests/smoke -q
 	rm -rf .smoke-venv

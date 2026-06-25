@@ -11,7 +11,6 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any, ClassVar, Literal
 
-import infino
 import pyarrow as pa
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import BaseNode
@@ -23,12 +22,14 @@ from llama_index.core.vector_stores.types import (
     VectorStoreQueryResult,
 )
 
+import infino
 from llama_index.vector_stores.infino._arrow import (
     NODE_CONTENT_COLUMN,
     NODE_TYPE_COLUMN,
     SCORE_COLUMN,
     encode_node,
     is_empty_result_error,
+    is_no_storage_error,
     rows_to_results,
     sql_lit,
     vector_array,
@@ -71,8 +72,8 @@ class InfinoVectorStore(BasePydanticVectorStore):
     """
 
     stores_text: bool = True
-    flat_metadata: bool = False
     is_embedding_query: bool = True
+    flat_metadata: ClassVar[bool] = False
 
     _connection: infino.Connection = PrivateAttr()
     _table: infino.Table = PrivateAttr()
@@ -110,7 +111,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
         metadata_columns: Sequence[pa.Field] = (),
         n_cent: int = DEFAULT_N_CENT,
     ) -> None:
-        super().__init__()
+        super().__init__(stores_text=True, is_embedding_query=True)
         self._connection = connection
         self._table_name = table_name
         self._dim = dim
@@ -141,7 +142,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
         return ids
 
     def delete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
-        self._table.delete(f"{self._ref_doc_id_column} = {sql_lit(ref_doc_id)}")
+        self._safe_delete(f"{self._ref_doc_id_column} = {sql_lit(ref_doc_id)}")
 
     def delete_nodes(
         self,
@@ -152,7 +153,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
         predicate = self._where(node_ids=node_ids, filters=filters)
         if predicate is None:
             return
-        self._table.delete(predicate)
+        self._safe_delete(predicate)
 
     def get_nodes(
         self,
@@ -403,7 +404,16 @@ class InfinoVectorStore(BasePydanticVectorStore):
         if not ids:
             return
         id_list = ", ".join(sql_lit(i) for i in ids)
-        self._table.delete(f"{self._node_id_column} IN ({id_list})")
+        self._safe_delete(f"{self._node_id_column} IN ({id_list})")
+
+    def _safe_delete(self, predicate: str) -> None:
+        """``Table.delete`` requires durable storage; memory connections no-op."""
+        try:
+            self._table.delete(predicate)
+        except RuntimeError as exc:
+            if is_no_storage_error(exc):
+                return
+            raise
 
     def _to_result(
         self, table: pa.Table, *, distance_metric: bool
