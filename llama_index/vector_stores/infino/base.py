@@ -27,11 +27,13 @@ from llama_index.vector_stores.infino._arrow import (
     NODE_TYPE_COLUMN,
     SCORE_COLUMN,
     encode_node,
+    is_empty_result_error,
     rows_to_results,
     sql_lit,
     vector_array,
     vector_literal,
 )
+from llama_index.vector_stores.infino._filters import compile_filters
 
 Metric = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
 
@@ -78,6 +80,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
     _ref_doc_id_column: str = PrivateAttr()
     _metadata_columns: list[pa.Field] = PrivateAttr()
     _metadata_column_names: list[str] = PrivateAttr()
+    _n_cent: int = PrivateAttr()
 
     SUPPORTED_MODES: ClassVar[frozenset[VectorStoreQueryMode]] = frozenset(
         {
@@ -113,6 +116,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
         self._ref_doc_id_column = ref_doc_id_column
         self._metadata_columns = list(metadata_columns)
         self._metadata_column_names = [f.name for f in self._metadata_columns]
+        self._n_cent = n_cent
         self._table = _open_or_create(connection, table_name, self._build_schema(), n_cent, metric)
 
     @property
@@ -133,6 +137,46 @@ class InfinoVectorStore(BasePydanticVectorStore):
 
     def delete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
         self._table.delete(f"{self._ref_doc_id_column} = {sql_lit(ref_doc_id)}")
+
+    def delete_nodes(
+        self,
+        node_ids: list[str] | None = None,
+        filters: MetadataFilters | None = None,
+        **delete_kwargs: Any,
+    ) -> None:
+        predicate = self._where(node_ids=node_ids, filters=filters)
+        if predicate is None:
+            return
+        self._table.delete(predicate)
+
+    def get_nodes(
+        self,
+        node_ids: list[str] | None = None,
+        filters: MetadataFilters | None = None,
+    ) -> list[BaseNode]:
+        if node_ids is None and filters is None:
+            raise ValueError("get_nodes requires node_ids or filters")
+        predicate = self._where(node_ids=node_ids, filters=filters) or "TRUE"
+        projection = self._read_projection()
+        columns = ", ".join(projection)
+        sql = f"SELECT {columns} FROM {self._table_name} WHERE {predicate}"
+        table = self._safe_query_sql(sql)
+        nodes, _, _ = rows_to_results(
+            table,
+            node_id_column=self._node_id_column,
+            text_column=self._text_column,
+        )
+        return nodes
+
+    def clear(self) -> None:
+        self._connection.drop_table(self._table_name, purge=True)
+        self._table = _open_or_create(
+            self._connection,
+            self._table_name,
+            self._build_schema(),
+            self._n_cent,
+            self._metric,
+        )
 
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         mode = query.mode
@@ -178,7 +222,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
             f"{sql_lit(vector_literal(embedding))}, {k}) "
             f"ORDER BY {SCORE_COLUMN} DESC"
         )
-        return self._to_result(self._connection.query_sql(sql), distance_metric=False)
+        return self._to_result(self._safe_query_sql(sql), distance_metric=False)
 
     def _mmr_query(
         self, query: VectorStoreQuery, **kwargs: Any
@@ -227,6 +271,9 @@ class InfinoVectorStore(BasePydanticVectorStore):
         return VectorStoreQueryResult(nodes=nodes, ids=ids, similarities=sims)
 
     def _projection(self) -> list[str]:
+        return [*self._read_projection(), SCORE_COLUMN]
+
+    def _read_projection(self) -> list[str]:
         return [
             self._node_id_column,
             self._ref_doc_id_column,
@@ -234,8 +281,32 @@ class InfinoVectorStore(BasePydanticVectorStore):
             *self._metadata_column_names,
             NODE_CONTENT_COLUMN,
             NODE_TYPE_COLUMN,
-            SCORE_COLUMN,
         ]
+
+    def _where(
+        self,
+        *,
+        node_ids: Sequence[str] | None,
+        filters: MetadataFilters | None,
+    ) -> str | None:
+        parts: list[str] = []
+        if node_ids:
+            id_list = ", ".join(sql_lit(i) for i in node_ids)
+            parts.append(f"{self._node_id_column} IN ({id_list})")
+        if filters is not None:
+            parts.append(compile_filters(filters, self._metadata_column_names))
+        if not parts:
+            return None
+        return " AND ".join(parts) if len(parts) > 1 else parts[0]
+
+    def _safe_query_sql(self, sql: str) -> pa.Table:
+        """Run SQL, treating the engine's empty-result signals as an empty table."""
+        try:
+            return self._connection.query_sql(sql)
+        except (ValueError, RuntimeError) as exc:
+            if is_empty_result_error(exc):
+                return pa.table({name: [] for name in self._read_projection()})
+            raise
 
     def _append(self, nodes: Sequence[BaseNode], ids: Sequence[str]) -> None:
         rows = [encode_node(n, self._metadata_column_names) for n in nodes]

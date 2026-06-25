@@ -19,8 +19,9 @@ NODE_CONTENT_COLUMN = "_node_content"
 NODE_TYPE_COLUMN = "_node_type"
 SCORE_COLUMN = "score"
 
-# Engine error string when a query has no matching rows — see vector_stores/infino issue.
-_EMPTY_RESULT_MARKER = "at least one RecordBatch"
+# Engine raises one of these when a SQL query returns no rows or the table
+# has not been written to yet; both mean "no data" to the integration.
+_EMPTY_RESULT_MARKERS = ("at least one RecordBatch", "manifest load error")
 
 
 def sql_lit(value: str) -> str:
@@ -112,6 +113,8 @@ def rows_to_results(
 
 
 def is_empty_result_error(exc: BaseException) -> bool:
-    """Engine raises a ``ValueError`` carrying this string when a SQL query
-    yields zero matching rows; treat as an empty result."""
-    return isinstance(exc, ValueError) and _EMPTY_RESULT_MARKER in str(exc)
+    """Whether ``exc`` is the engine's "no rows / never-written" signal."""
+    if not isinstance(exc, (ValueError, RuntimeError)):
+        return False
+    msg = str(exc)
+    return any(marker in msg for marker in _EMPTY_RESULT_MARKERS)
