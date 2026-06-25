@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llama-index-vector-stores-infino"
+version = "0.1.0"
+description = "LlamaIndex integration for Infino — vector, BM25, hybrid (RRF), and SQL retrieval over one engine on object storage."
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+license = { text = "Apache-2.0" }
+authors = [{ name = "The Infino Authors" }]
+keywords = [
+    "llama-index",
+    "llamaindex",
+    "infino",
+    "vector-store",
+    "retrieval",
+    "rag",
+    "hybrid-search",
+    "bm25",
+    "vector-search",
+]
+dependencies = [
+    "llama-index-core>=0.13,<0.15",
+    "infino>=0.1.0",
+    "pyarrow>=14",
+    "numpy>=1.26",
+]
+
+[project.urls]
+Homepage = "https://github.com/infino-ai/llama-index-vector-stores-infino"
+Repository = "https://github.com/infino-ai/llama-index-vector-stores-infino"
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+lint = ["ruff", "mypy"]
+
+[tool.hatch.build.targets.sdist]
+include = ["llama_index/"]
+
+[tool.hatch.build.targets.wheel]
+include = ["llama_index/"]
+
+[tool.llamahub]
+contains_example = false
+import_path = "llama_index.vector_stores.infino"
+
+[tool.llamahub.class_authors]
+InfinoVectorStore = "infino-ai"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.mypy]
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*", "infino", "infino.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
