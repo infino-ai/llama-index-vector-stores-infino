@@ -7,12 +7,230 @@ BM25, hybrid (RRF), and SQL retrieval all run over that one table.
 
 from __future__ import annotations
 
-from llama_index.core.vector_stores.types import BasePydanticVectorStore
+from collections.abc import Sequence
+from typing import Any, ClassVar, Literal
+
+import infino
+import pyarrow as pa
+from llama_index.core.bridge.pydantic import PrivateAttr
+from llama_index.core.schema import BaseNode
+from llama_index.core.vector_stores.types import (
+    BasePydanticVectorStore,
+    MetadataFilters,
+    VectorStoreQuery,
+    VectorStoreQueryMode,
+    VectorStoreQueryResult,
+)
+
+from llama_index.vector_stores.infino._arrow import (
+    NODE_CONTENT_COLUMN,
+    NODE_TYPE_COLUMN,
+    SCORE_COLUMN,
+    encode_node,
+    rows_to_results,
+    sql_lit,
+    vector_array,
+)
+
+Metric = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
+
+DEFAULT_METRIC: Metric = "cosine"
+DEFAULT_TEXT_COLUMN = "text"
+DEFAULT_VECTOR_COLUMN = "embedding"
+DEFAULT_NODE_ID_COLUMN = "node_id"
+DEFAULT_REF_DOC_ID_COLUMN = "ref_doc_id"
+# IVF builder clamps n_cent <= 64 below 100K rows; 64 is the effective max.
+DEFAULT_N_CENT = 64
 
 
 class InfinoVectorStore(BasePydanticVectorStore):
-    """LlamaIndex ``BasePydanticVectorStore`` backed by a single Infino table."""
+    """LlamaIndex vector store backed by a single Infino table.
+
+    Args:
+        connection: a live :class:`infino.Connection`.
+        table_name: table to open; created if it does not exist.
+        dim: embedding dimension; must match the table's vector column.
+        metric: distance metric — ``"cosine"`` (default), ``"l2sq"`` / ``"l2"``,
+            ``"negdot"`` / ``"dot"``.
+        text_column / vector_column / node_id_column / ref_doc_id_column:
+            column names.
+        metadata_columns: metadata keys promoted to filterable scalar columns.
+            The remainder of each node's metadata round-trips via the JSON
+            catch-all but is not filterable. Fixed at table creation.
+        n_cent: IVF centroid count (engine-clamped on small tables).
+    """
 
     stores_text: bool = True
     flat_metadata: bool = False
     is_embedding_query: bool = True
+
+    _connection: infino.Connection = PrivateAttr()
+    _table: infino.Table = PrivateAttr()
+    _table_name: str = PrivateAttr()
+    _dim: int = PrivateAttr()
+    _metric: Metric = PrivateAttr()
+    _text_column: str = PrivateAttr()
+    _vector_column: str = PrivateAttr()
+    _node_id_column: str = PrivateAttr()
+    _ref_doc_id_column: str = PrivateAttr()
+    _metadata_columns: list[pa.Field] = PrivateAttr()
+    _metadata_column_names: list[str] = PrivateAttr()
+
+    SUPPORTED_MODES: ClassVar[frozenset[VectorStoreQueryMode]] = frozenset(
+        {
+            VectorStoreQueryMode.DEFAULT,
+        }
+    )
+
+    def __init__(
+        self,
+        connection: infino.Connection,
+        table_name: str,
+        *,
+        dim: int,
+        metric: Metric = DEFAULT_METRIC,
+        text_column: str = DEFAULT_TEXT_COLUMN,
+        vector_column: str = DEFAULT_VECTOR_COLUMN,
+        node_id_column: str = DEFAULT_NODE_ID_COLUMN,
+        ref_doc_id_column: str = DEFAULT_REF_DOC_ID_COLUMN,
+        metadata_columns: Sequence[pa.Field] = (),
+        n_cent: int = DEFAULT_N_CENT,
+    ) -> None:
+        super().__init__()
+        self._connection = connection
+        self._table_name = table_name
+        self._dim = dim
+        self._metric = metric
+        self._text_column = text_column
+        self._vector_column = vector_column
+        self._node_id_column = node_id_column
+        self._ref_doc_id_column = ref_doc_id_column
+        self._metadata_columns = list(metadata_columns)
+        self._metadata_column_names = [f.name for f in self._metadata_columns]
+        self._table = _open_or_create(connection, table_name, self._build_schema(), n_cent, metric)
+
+    @property
+    def client(self) -> infino.Connection:
+        return self._connection
+
+    @property
+    def table(self) -> infino.Table:
+        return self._table
+
+    def add(self, nodes: Sequence[BaseNode], **kwargs: Any) -> list[str]:
+        if not nodes:
+            return []
+        ids = [n.node_id for n in nodes]
+        self._delete_node_ids(ids)
+        self._append(nodes, ids)
+        return ids
+
+    def delete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
+        self._table.delete(f"{self._ref_doc_id_column} = {sql_lit(ref_doc_id)}")
+
+    def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+        mode = query.mode
+        if mode not in self.SUPPORTED_MODES:
+            raise NotImplementedError(f"query mode {mode!r} is not supported")
+        if query.query_embedding is None:
+            raise ValueError("query.query_embedding is required for vector search")
+        result = self._table.vector_search(
+            self._vector_column,
+            list(query.query_embedding),
+            query.similarity_top_k,
+            projection=self._projection(),
+        )
+        return self._to_result(result, distance_metric=True)
+
+    def _projection(self) -> list[str]:
+        return [
+            self._node_id_column,
+            self._ref_doc_id_column,
+            self._text_column,
+            *self._metadata_column_names,
+            NODE_CONTENT_COLUMN,
+            NODE_TYPE_COLUMN,
+            SCORE_COLUMN,
+        ]
+
+    def _append(self, nodes: Sequence[BaseNode], ids: Sequence[str]) -> None:
+        rows = [encode_node(n, self._metadata_column_names) for n in nodes]
+        arrays: list[pa.Array] = [
+            pa.array(ids, type=pa.large_utf8()),
+            pa.array([r["ref_doc_id"] for r in rows], type=pa.large_utf8()),
+            pa.array([r["text"] for r in rows], type=pa.large_utf8()),
+            vector_array([r["embedding"] for r in rows], self._dim),
+        ]
+        for field in self._metadata_columns:
+            arrays.append(pa.array([r.get(field.name) for r in rows], type=field.type))
+        arrays.append(pa.array([r[NODE_CONTENT_COLUMN] for r in rows], type=pa.large_utf8()))
+        arrays.append(pa.array([r[NODE_TYPE_COLUMN] for r in rows], type=pa.large_utf8()))
+        batch = pa.record_batch(arrays, schema=self._table.schema())
+        self._table.append(batch)
+
+    def _delete_node_ids(self, ids: Sequence[str]) -> None:
+        if not ids:
+            return
+        id_list = ", ".join(sql_lit(i) for i in ids)
+        self._table.delete(f"{self._node_id_column} IN ({id_list})")
+
+    def _to_result(
+        self, table: pa.Table, *, distance_metric: bool
+    ) -> VectorStoreQueryResult:
+        nodes, ids, scores = rows_to_results(
+            table,
+            node_id_column=self._node_id_column,
+            text_column=self._text_column,
+        )
+        similarities = (
+            [_distance_to_similarity(self._metric, s) for s in scores]
+            if distance_metric and scores is not None
+            else scores
+        )
+        return VectorStoreQueryResult(nodes=nodes, ids=ids, similarities=similarities)
+
+    def _build_schema(self) -> pa.Schema:
+        return pa.schema(
+            [
+                pa.field(self._node_id_column, pa.large_utf8(), nullable=False),
+                pa.field(self._ref_doc_id_column, pa.large_utf8(), nullable=False),
+                pa.field(self._text_column, pa.large_utf8(), nullable=False),
+                pa.field(
+                    self._vector_column,
+                    pa.list_(pa.float32(), self._dim),
+                    nullable=False,
+                ),
+                *self._metadata_columns,
+                pa.field(NODE_CONTENT_COLUMN, pa.large_utf8(), nullable=False),
+                pa.field(NODE_TYPE_COLUMN, pa.large_utf8(), nullable=False),
+            ]
+        )
+
+
+def _open_or_create(
+    connection: infino.Connection,
+    table_name: str,
+    schema: pa.Schema,
+    n_cent: int,
+    metric: Metric,
+) -> infino.Table:
+    if table_name in connection.list_tables():
+        return connection.open_table(table_name)
+    indexes = (
+        infino.IndexSpec()
+        .fts(schema.field(0).name)  # node_id
+        .fts(schema.field(1).name)  # ref_doc_id
+        .fts(schema.field(2).name)  # text
+        .vector(schema.field(3).name, schema.field(3).type.list_size, n_cent, metric)
+    )
+    return connection.create_table(table_name, schema, indexes)
+
+
+def _distance_to_similarity(metric: Metric, distance: float) -> float:
+    """Map raw distance into a [0, 1] relevance where higher is better."""
+    if metric == "cosine":
+        return max(0.0, min(1.0, 1.0 - distance))
+    if metric in ("l2", "l2sq"):
+        return 1.0 / (1.0 + distance)
+    # negdot/dot: smaller distance means more similar; negate so larger = better.
+    return -distance
