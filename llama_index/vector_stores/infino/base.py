@@ -30,6 +30,7 @@ from llama_index.vector_stores.infino._arrow import (
     rows_to_results,
     sql_lit,
     vector_array,
+    vector_literal,
 )
 
 Metric = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
@@ -41,6 +42,8 @@ DEFAULT_NODE_ID_COLUMN = "node_id"
 DEFAULT_REF_DOC_ID_COLUMN = "ref_doc_id"
 # IVF builder clamps n_cent <= 64 below 100K rows; 64 is the effective max.
 DEFAULT_N_CENT = 64
+# MMR re-embeds candidate texts; over-fetch a wider pool than the final top-k.
+DEFAULT_MMR_FETCH_K = 20
 
 
 class InfinoVectorStore(BasePydanticVectorStore):
@@ -79,6 +82,9 @@ class InfinoVectorStore(BasePydanticVectorStore):
     SUPPORTED_MODES: ClassVar[frozenset[VectorStoreQueryMode]] = frozenset(
         {
             VectorStoreQueryMode.DEFAULT,
+            VectorStoreQueryMode.TEXT_SEARCH,
+            VectorStoreQueryMode.HYBRID,
+            VectorStoreQueryMode.MMR,
         }
     )
 
@@ -130,17 +136,95 @@ class InfinoVectorStore(BasePydanticVectorStore):
 
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         mode = query.mode
-        if mode not in self.SUPPORTED_MODES:
-            raise NotImplementedError(f"query mode {mode!r} is not supported")
-        if query.query_embedding is None:
-            raise ValueError("query.query_embedding is required for vector search")
+        if mode == VectorStoreQueryMode.DEFAULT:
+            return self._vector_query(query)
+        if mode == VectorStoreQueryMode.TEXT_SEARCH:
+            return self._text_query(query)
+        if mode == VectorStoreQueryMode.HYBRID:
+            return self._hybrid_query(query)
+        if mode == VectorStoreQueryMode.MMR:
+            return self._mmr_query(query, **kwargs)
+        raise NotImplementedError(f"query mode {mode!r} is not supported")
+
+    def _vector_query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
+        embedding = _require_embedding(query)
         result = self._table.vector_search(
             self._vector_column,
-            list(query.query_embedding),
+            embedding,
             query.similarity_top_k,
             projection=self._projection(),
         )
         return self._to_result(result, distance_metric=True)
+
+    def _text_query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
+        query_str = _require_query_str(query, "TEXT_SEARCH")
+        result = self._table.bm25_search(
+            self._text_column,
+            query_str,
+            query.similarity_top_k,
+            projection=self._projection(),
+        )
+        return self._to_result(result, distance_metric=False)
+
+    def _hybrid_query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
+        query_str = _require_query_str(query, "HYBRID")
+        embedding = _require_embedding(query)
+        k = query.hybrid_top_k or query.similarity_top_k
+        columns = ", ".join(self._projection())
+        sql = (
+            f"SELECT {columns} FROM hybrid_search("
+            f"{sql_lit(self._table_name)}, {sql_lit(self._text_column)}, "
+            f"{sql_lit(query_str)}, {sql_lit(self._vector_column)}, "
+            f"{sql_lit(vector_literal(embedding))}, {k}) "
+            f"ORDER BY {SCORE_COLUMN} DESC"
+        )
+        return self._to_result(self._connection.query_sql(sql), distance_metric=False)
+
+    def _mmr_query(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> VectorStoreQueryResult:
+        # Local imports keep llama-index-core's MMR utilities out of the import path
+        # of users who never reach for MMR.
+        from llama_index.core.indices.query.embedding_utils import (
+            get_top_k_mmr_embeddings,
+        )
+
+        embed_model = kwargs.get("embed_model")
+        if embed_model is None:
+            raise ValueError(
+                "MMR requires `embed_model` in vector_store_kwargs: Infino "
+                "does not return stored vectors, so candidate texts are re-embedded"
+            )
+        query_embedding = _require_embedding(query)
+        fetch_k = int(kwargs.get("mmr_fetch_k", DEFAULT_MMR_FETCH_K))
+        candidates = self._table.vector_search(
+            self._vector_column,
+            query_embedding,
+            fetch_k,
+            projection=self._projection(),
+        )
+        base = self._to_result(candidates, distance_metric=True)
+        if not base.nodes:
+            return base
+        candidate_embeddings = embed_model.get_text_embedding_batch(
+            [n.get_content() for n in base.nodes]
+        )
+        _scores, selected_idx = get_top_k_mmr_embeddings(
+            query_embedding=query_embedding,
+            embeddings=candidate_embeddings,
+            similarity_top_k=query.similarity_top_k,
+            embedding_ids=list(range(len(base.nodes))),
+            mmr_threshold=query.mmr_threshold,
+        )
+        nodes = [base.nodes[i] for i in selected_idx]
+        ids_list = base.ids or []
+        ids = [ids_list[i] for i in selected_idx] if ids_list else []
+        sims = (
+            [base.similarities[i] for i in selected_idx]
+            if base.similarities is not None
+            else None
+        )
+        return VectorStoreQueryResult(nodes=nodes, ids=ids, similarities=sims)
 
     def _projection(self) -> list[str]:
         return [
@@ -224,6 +308,18 @@ def _open_or_create(
         .vector(schema.field(3).name, schema.field(3).type.list_size, n_cent, metric)
     )
     return connection.create_table(table_name, schema, indexes)
+
+
+def _require_embedding(query: VectorStoreQuery) -> list[float]:
+    if query.query_embedding is None:
+        raise ValueError("query.query_embedding is required for this mode")
+    return list(query.query_embedding)
+
+
+def _require_query_str(query: VectorStoreQuery, mode: str) -> str:
+    if not query.query_str:
+        raise ValueError(f"query.query_str is required for {mode}")
+    return query.query_str
 
 
 def _distance_to_similarity(metric: Metric, distance: float) -> float:
