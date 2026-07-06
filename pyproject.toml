@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llama-index-vector-stores-infino"
+version = "0.1.0"
+description = "LlamaIndex integration for Infino — vector, BM25, hybrid (RRF), and SQL retrieval over one engine on object storage."
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Infino", email = "tech@infino.ai" }]
+keywords = [
+    "llama-index", "llamaindex", "infino", "vector-store", "vectorstore",
+    "vector-database", "retrieval", "rag", "hybrid-search", "bm25",
+    "vector-search", "semantic-search", "embeddings", "retriever",
+    "information-retrieval", "object-storage", "s3",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: Indexing",
+    "Typing :: Typed",
+]
+dependencies = [
+    "llama-index-core>=0.13,<0.15",
+    "infino>=0.1.4",
+    "pyarrow>=14",
+    "numpy>=1.26",
+]
+
+[project.urls]
+Homepage = "https://infino.ai"
+Documentation = "https://docs.infino.ai"
+Repository = "https://github.com/infino-ai/llama-index-vector-stores-infino"
+Issues = "https://github.com/infino-ai/llama-index-vector-stores-infino/issues"
+Changelog = "https://github.com/infino-ai/llama-index-vector-stores-infino/releases"
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+lint = ["ruff", "mypy"]
+
+[tool.codespell]
+check-filenames = true
+check-hidden = true
+# NIN = LlamaIndex FilterOperator.NIN (not-in), not a typo.
+ignore-words-list = "nin"
+skip = "*.csv,*.html,*.json,*.jsonl,*.pdf,*.txt,*.ipynb,*.lock"
+
+[tool.hatch.build.targets.sdist]
+include = ["llama_index/"]
+
+[tool.hatch.build.targets.wheel]
+include = ["llama_index/"]
+
+[tool.llamahub]
+contains_example = false
+import_path = "llama_index.vector_stores.infino"
+
+[tool.llamahub.class_authors]
+InfinoVectorStore = "infino-ai"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.mypy]
+strict = true
+explicit_package_bases = true
+namespace_packages = true
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*", "infino", "infino.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
