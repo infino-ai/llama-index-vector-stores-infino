@@ -1,0 +1,123 @@
+name: Publish to PyPI
+
+# Manually-triggered release of the `llama-index-vector-stores-infino` package:
+# validate and stamp the version, build the sdist + wheel, smoke-test the wheel,
+# then upload to TestPyPI (default) or PyPI.
+#
+# Pure-Python package (hatchling): one universal `py3-none-any` wheel, no build
+# matrix. Distribution is sdist + wheel; the engine (`infino`) is an ordinary
+# released dependency pip resolves at install time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, PEP 440 (e.g. 0.1.0, 0.1.0rc1)"
+        required: true
+        type: string
+      target:
+        description: "Index to publish to"
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi, pypi]
+
+# One release per index at a time; never cancel a publish in flight.
+concurrency:
+  group: publish-${{ inputs.target }}
+  cancel-in-progress: false
+
+# Least privilege by default; the publish job widens to `id-token: write` for
+# PyPI Trusted Publishing (OIDC). No long-lived credentials.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: check
+        name: Validate version
+        run: |
+          version="${{ inputs.version }}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-]?(a|b|rc|alpha|beta|post|dev)[0-9]+)?$ ]]; then
+            echo "::error::invalid release version (must be PEP 440): $version"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The version is static in pyproject; stamp it from the input so the
+      # built artifacts carry the release version.
+      - name: Stamp version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 - "$VERSION" <<'PY'
+          import pathlib, re, sys
+
+          version = sys.argv[1]
+          pyproject = pathlib.Path("pyproject.toml")
+          patched, count = re.subn(
+              r'(?m)^version = "[^"]*"', f'version = "{version}"',
+              pyproject.read_text(), count=1)
+          assert count == 1, "[project] version not found in pyproject.toml"
+          pyproject.write_text(patched)
+          print(f"stamped llama-index-vector-stores-infino -> {version}")
+          PY
+
+      - name: Build
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build
+
+      # Install the freshly built wheel into a clean interpreter (pulling infino
+      # and llama-index-core from PyPI) and run the smoke suite, proving it
+      # imports and round-trips before publish.
+      - name: Smoke-test wheel
+        run: |
+          python3 -m pip install dist/*.whl pytest pytest-asyncio
+          python3 -m pytest tests/smoke -q
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish to ${{ inputs.target }}
+    needs: build
+    runs-on: ubuntu-latest
+    # `environment` is load-bearing, not decoration: the PyPI/TestPyPI trusted
+    # publisher is keyed to it (plus repo + workflow file), and it can gate
+    # `pypi` behind required reviewers. `id-token: write` lets the upload
+    # authenticate over OIDC instead of a stored token.
+    permissions:
+      id-token: write
+      contents: read
+    environment: ${{ inputs.target }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate distributions
+        run: |
+          python3 -m pip install --upgrade twine
+          python3 -m twine check dist/*
+      # Trusted Publishing: no `password` — the action exchanges the OIDC token
+      # with the index. `repository-url` selects PyPI vs TestPyPI.
+      - name: Upload to ${{ inputs.target }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: ${{ inputs.target == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
