@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      # Resolve infino from TestPyPI to test an unreleased engine build.
+      infino_index:
+        description: "Index to resolve infino from"
+        default: pypi
+        type: choice
+        options: [pypi, testpypi]
+      infino_version:
+        description: "Exact infino version to pin (blank = latest on the chosen index)"
+        default: ""
+        type: string
+  schedule:
+    - cron: "0 6 * * 1"  # weekly: catch upstream llama-index-core / infino drift
+
+# Routes every pip call to TestPyPI for infino; empty (push/PR/schedule) is a no-op.
+env:
+  PIP_EXTRA_INDEX_URL: ${{ inputs.infino_index == 'testpypi' && 'https://test.pypi.org/simple/' || '' }}
+
+jobs:
+  # Lint, type-check, and the engine-free unit suite. Runs on every push/PR.
+  lint-unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Pin infino
+        if: inputs.infino_version != ''
+        run: pip install "infino==${{ inputs.infino_version }}"
+      - run: pip install -e ".[test,lint]"
+      - run: ruff check .
+      - run: codespell --toml pyproject.toml llama_index tests README.md CHANGELOG.md
+      - run: mypy llama_index
+      - run: pytest tests/unit -q
+
+  # Full suite (integration + end-to-end) against the engine, pulled from PyPI
+  # with the rest of the deps.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Pin infino
+        if: inputs.infino_version != ''
+        run: pip install "infino==${{ inputs.infino_version }}"
+      - run: pip install -e ".[test,lint]"
+      - run: pytest tests/integration -q
+
+  # Build the wheel and run the smoke test against it in a clean environment —
+  # validates packaging (data files, deps) and that the published infino wheel
+  # satisfies the API.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - name: Pin infino
+        if: inputs.infino_version != ''
+        run: pip install "infino==${{ inputs.infino_version }}"
+      - run: pip install "$(ls dist/*.whl)" pytest pytest-asyncio
+      - run: pytest tests/smoke -q
