@@ -8,29 +8,24 @@ from llama_index.vector_stores.infino._arrow import (
     NODE_TYPE_COLUMN,
     SCORE_COLUMN,
     encode_node,
-    is_empty_result_error,
+    is_empty_table_error,
+    quote_str,
     rows_to_results,
-    sql_lit,
-    sql_literal,
+    sql_value,
     vector_array,
-    vector_literal,
 )
 
 
-def test_sql_lit_escapes_single_quotes():
-    assert sql_lit("o'reilly") == "'o''reilly'"
+def test_quote_str_escapes_single_quotes():
+    assert quote_str("o'reilly") == "'o''reilly'"
 
 
-def test_sql_literal_handles_primitive_types():
-    assert sql_literal(5) == "5"
-    assert sql_literal(3.14) == "3.14"
-    assert sql_literal(True) == "true"
-    assert sql_literal(False) == "false"
-    assert sql_literal("x") == "'x'"
-
-
-def test_vector_literal_renders_csv_floats():
-    assert vector_literal([0.1, 0.2, 0.3]) == "0.1,0.2,0.3"
+def test_sql_value_handles_primitive_types():
+    assert sql_value(5) == "5"
+    assert sql_value(3.14) == "3.14"
+    assert sql_value(True) == "true"
+    assert sql_value(False) == "false"
+    assert sql_value("x") == "'x'"
 
 
 def test_vector_array_is_fixed_size_list_float32():
@@ -39,9 +34,7 @@ def test_vector_array_is_fixed_size_list_float32():
 
 
 def test_encode_decode_roundtrip_via_arrow_table():
-    node = TextNode(
-        text="hello world", id_="n1", embedding=[0.5] * 4, metadata={"src": "doc1"}
-    )
+    node = TextNode(text="hello world", id_="n1", embedding=[0.5] * 4, metadata={"src": "doc1"})
     node.relationships = {}
     row = encode_node(node, declared_keys=["src"])
     assert row["text"] == "hello world"
@@ -59,9 +52,7 @@ def test_encode_decode_roundtrip_via_arrow_table():
             SCORE_COLUMN: [0.42],
         }
     )
-    nodes, ids, scores = rows_to_results(
-        table, node_id_column="node_id", text_column="text"
-    )
+    nodes, ids, scores = rows_to_results(table, node_id_column="node_id", text_column="text")
     assert ids == [node.node_id]
     assert scores == [0.42]
     assert nodes[0].get_content() == "hello world"
@@ -70,17 +61,13 @@ def test_encode_decode_roundtrip_via_arrow_table():
 
 def test_rows_to_results_handles_empty_table():
     empty = pa.table({"node_id": [], "text": []})
-    nodes, ids, scores = rows_to_results(
-        empty, node_id_column="node_id", text_column="text"
-    )
+    nodes, ids, scores = rows_to_results(empty, node_id_column="node_id", text_column="text")
     assert nodes == [] and ids == [] and scores is None
 
 
-def test_is_empty_result_error_recognizes_engine_signals():
-    assert is_empty_result_error(ValueError("Must pass schema, or at least one RecordBatch"))
-    assert is_empty_result_error(RuntimeError("manifest load error"))
-    assert is_empty_result_error(
-        ValueError("Error during planning: backend: manifest load error")
-    )
-    assert not is_empty_result_error(KeyError("nope"))
-    assert not is_empty_result_error(ValueError("unrelated"))
+def test_is_empty_table_error_recognizes_engine_signals():
+    assert is_empty_table_error(ValueError("Must pass schema, or at least one RecordBatch"))
+    assert is_empty_table_error(RuntimeError("manifest load error"))
+    assert is_empty_table_error(ValueError("Error during planning: backend: manifest load error"))
+    assert not is_empty_table_error(KeyError("nope"))
+    assert not is_empty_table_error(ValueError("unrelated"))
