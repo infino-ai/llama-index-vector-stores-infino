@@ -9,28 +9,41 @@ description = "LlamaIndex integration for Infino — vector, BM25, hybrid (RRF),
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 license = { text = "Apache-2.0" }
-authors = [{ name = "The Infino Authors" }]
+authors = [{ name = "Infino", email = "tech@infino.ai" }]
 keywords = [
-    "llama-index",
-    "llamaindex",
-    "infino",
-    "vector-store",
-    "retrieval",
-    "rag",
-    "hybrid-search",
-    "bm25",
-    "vector-search",
+    "llama-index", "llamaindex", "infino", "vector-store", "vectorstore",
+    "vector-database", "retrieval", "rag", "hybrid-search", "bm25",
+    "vector-search", "semantic-search", "embeddings", "retriever",
+    "information-retrieval", "object-storage", "s3",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: Indexing",
+    "Typing :: Typed",
 ]
 dependencies = [
     "llama-index-core>=0.13,<0.15",
-    "infino>=0.1.0",
+    "infino>=0.1.4",
     "pyarrow>=14",
     "numpy>=1.26",
 ]
 
 [project.urls]
-Homepage = "https://github.com/infino-ai/llama-index-vector-stores-infino"
+Homepage = "https://infino.ai"
+Documentation = "https://docs.infino.ai"
 Repository = "https://github.com/infino-ai/llama-index-vector-stores-infino"
+Issues = "https://github.com/infino-ai/llama-index-vector-stores-infino/issues"
+Changelog = "https://github.com/infino-ai/llama-index-vector-stores-infino/releases"
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio"]
