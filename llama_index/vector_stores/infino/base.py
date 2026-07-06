@@ -1,8 +1,8 @@
 """The :class:`InfinoVectorStore` LlamaIndex vector store.
 
-One Infino table holds the node id, the text, the embedding, the parent
-``ref_doc_id``, declared metadata columns, and a JSON catch-all. Vector,
-BM25, hybrid (RRF), and SQL retrieval all run over that one table.
+One Infino table holds each node's id, text, embedding, ``ref_doc_id``,
+declared metadata columns, and a JSON catch-all; vector, BM25, hybrid (RRF),
+and SQL retrieval all run over it.
 """
 
 from __future__ import annotations
@@ -28,12 +28,10 @@ from llama_index.vector_stores.infino._arrow import (
     NODE_TYPE_COLUMN,
     SCORE_COLUMN,
     encode_node,
-    is_empty_result_error,
-    is_no_storage_error,
+    is_empty_table_error,
+    quote_str,
     rows_to_results,
-    sql_lit,
     vector_array,
-    vector_literal,
 )
 from llama_index.vector_stores.infino._filters import compile_filters
 
@@ -48,27 +46,25 @@ DEFAULT_REF_DOC_ID_COLUMN = "ref_doc_id"
 DEFAULT_N_CENT = 64
 # MMR re-embeds candidate texts; over-fetch a wider pool than the final top-k.
 DEFAULT_MMR_FETCH_K = 20
-# When filtering post-rank, over-fetch from the vector TVF and trim after WHERE.
-FILTER_OVERSAMPLE = 10
-
-SearchMode = Literal["or", "and"]
+# Structured filters run post-rank, so over-fetch from the vector TVF and trim.
+DEFAULT_FILTER_OVERSAMPLE = 10
 
 
 class InfinoVectorStore(BasePydanticVectorStore):
     """LlamaIndex vector store backed by a single Infino table.
 
     Args:
-        connection: a live :class:`infino.Connection`.
-        table_name: table to open; created if it does not exist.
-        dim: embedding dimension; must match the table's vector column.
-        metric: distance metric — ``"cosine"`` (default), ``"l2sq"`` / ``"l2"``,
-            ``"negdot"`` / ``"dot"``.
+        connection: a live :class:`infino.Connection` (durable; ``memory://``
+            cannot delete or upsert).
+        table_name: table to open; created if absent.
+        dim: embedding dimension (must be in ``[16, 4096]``).
+        metric: ``"cosine"`` (default), ``"l2sq"`` / ``"l2"``, ``"negdot"`` / ``"dot"``.
         text_column / vector_column / node_id_column / ref_doc_id_column:
             column names.
-        metadata_columns: metadata keys promoted to filterable scalar columns.
-            The remainder of each node's metadata round-trips via the JSON
-            catch-all but is not filterable. Fixed at table creation.
+        metadata_columns: metadata keys promoted to filterable scalar columns;
+            the rest round-trips via the JSON catch-all. Fixed at creation.
         n_cent: IVF centroid count (engine-clamped on small tables).
+        filter_oversample: over-fetch multiplier for structured-filter queries.
     """
 
     stores_text: bool = True
@@ -87,6 +83,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
     _metadata_columns: list[pa.Field] = PrivateAttr()
     _metadata_column_names: list[str] = PrivateAttr()
     _n_cent: int = PrivateAttr()
+    _filter_oversample: int = PrivateAttr()
 
     SUPPORTED_MODES: ClassVar[frozenset[VectorStoreQueryMode]] = frozenset(
         {
@@ -110,6 +107,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
         ref_doc_id_column: str = DEFAULT_REF_DOC_ID_COLUMN,
         metadata_columns: Sequence[pa.Field] = (),
         n_cent: int = DEFAULT_N_CENT,
+        filter_oversample: int = DEFAULT_FILTER_OVERSAMPLE,
     ) -> None:
         super().__init__(stores_text=True, is_embedding_query=True)
         self._connection = connection
@@ -123,7 +121,20 @@ class InfinoVectorStore(BasePydanticVectorStore):
         self._metadata_columns = list(metadata_columns)
         self._metadata_column_names = [f.name for f in self._metadata_columns]
         self._n_cent = n_cent
+        self._filter_oversample = filter_oversample
         self._table = _open_or_create(connection, table_name, self._build_schema(), n_cent, metric)
+
+    @classmethod
+    def from_params(
+        cls,
+        connection: infino.Connection,
+        table_name: str,
+        *,
+        dim: int,
+        **kwargs: Any,
+    ) -> InfinoVectorStore:
+        """Construct a store, opening or creating ``table_name``."""
+        return cls(connection, table_name, dim=dim, **kwargs)
 
     @property
     def client(self) -> infino.Connection:
@@ -137,12 +148,13 @@ class InfinoVectorStore(BasePydanticVectorStore):
         if not nodes:
             return []
         ids = [n.node_id for n in nodes]
+        # Upsert = delete-by-node_id then append; not atomic (no engine txn).
         self._delete_node_ids(ids)
         self._append(nodes, ids)
         return ids
 
     def delete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
-        self._safe_delete(f"{self._ref_doc_id_column} = {sql_lit(ref_doc_id)}")
+        self._table.delete(f"{self._ref_doc_id_column} = {quote_str(ref_doc_id)}")
 
     def delete_nodes(
         self,
@@ -151,9 +163,8 @@ class InfinoVectorStore(BasePydanticVectorStore):
         **delete_kwargs: Any,
     ) -> None:
         predicate = self._where(node_ids=node_ids, filters=filters)
-        if predicate is None:
-            return
-        self._safe_delete(predicate)
+        if predicate is not None:
+            self._table.delete(predicate)
 
     def get_nodes(
         self,
@@ -162,11 +173,12 @@ class InfinoVectorStore(BasePydanticVectorStore):
     ) -> list[BaseNode]:
         if node_ids is None and filters is None:
             raise ValueError("get_nodes requires node_ids or filters")
+        # node_ids alone → exact_match per id (the only pre-I/O prune for uuids).
+        if node_ids is not None and filters is None:
+            return self._get_by_ids(node_ids)
         predicate = self._where(node_ids=node_ids, filters=filters) or "TRUE"
-        projection = self._read_projection()
-        columns = ", ".join(projection)
-        sql = f"SELECT {columns} FROM {self._table_name} WHERE {predicate}"
-        table = self._safe_query_sql(sql)
+        columns = ", ".join(self._node_projection())
+        table = self._query_or_empty(f"SELECT {columns} FROM {self._table_name} WHERE {predicate}")
         nodes, _, _ = rows_to_results(
             table,
             node_id_column=self._node_id_column,
@@ -184,6 +196,24 @@ class InfinoVectorStore(BasePydanticVectorStore):
             self._metric,
         )
 
+    def count(self) -> int:
+        """Total row count."""
+        try:
+            table = self._connection.query_sql(f"SELECT COUNT(*) AS n FROM {self._table_name}")
+        except (ValueError, RuntimeError) as exc:
+            if is_empty_table_error(exc):
+                return 0
+            raise
+        return int(table.column("n")[0].as_py())
+
+    def optimize(self) -> None:
+        """Compact the table's superfiles."""
+        self._table.optimize()
+
+    def gc(self, grace_secs: float) -> None:
+        """Reclaim storage from files older than ``grace_secs``."""
+        self._table.gc(grace_secs)
+
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         mode = query.mode
         if mode == VectorStoreQueryMode.DEFAULT:
@@ -196,9 +226,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
             return self._mmr_query(query, **kwargs)
         raise NotImplementedError(f"query mode {mode!r} is not supported")
 
-    async def async_add(
-        self, nodes: Sequence[BaseNode], **kwargs: Any
-    ) -> list[str]:
+    async def async_add(self, nodes: Sequence[BaseNode], **kwargs: Any) -> list[str]:
         return await asyncio.to_thread(self.add, nodes, **kwargs)
 
     async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
@@ -222,23 +250,19 @@ class InfinoVectorStore(BasePydanticVectorStore):
     async def aclear(self) -> None:
         await asyncio.to_thread(self.clear)
 
-    async def aquery(
-        self, query: VectorStoreQuery, **kwargs: Any
-    ) -> VectorStoreQueryResult:
+    async def aquery(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         return await asyncio.to_thread(self.query, query, **kwargs)
 
     def search_by_sql(self, sql: str) -> VectorStoreQueryResult:
         """Run arbitrary SQL and map rows to a ``VectorStoreQueryResult``.
 
-        Project the store's columns (``node_id``, ``ref_doc_id``, the text
-        column, declared metadata, ``_node_content``, ``_node_type``, and
-        optionally ``score``) for full nodes.
+        The SELECT must project the store's read columns (node id, ref doc id,
+        text, declared metadata, the two ``_node_*`` catch-alls) and, for
+        ranking, ``score``.
         """
-        return self._to_result(self._safe_query_sql(sql), distance_metric=False)
+        return self._to_result(self._query_or_empty(sql), distance_metric=False)
 
-    def _vector_query(
-        self, query: VectorStoreQuery, **kwargs: Any
-    ) -> VectorStoreQueryResult:
+    def _vector_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         embedding = _require_embedding(query)
         filter_query = kwargs.get("filter_query")
         if query.filters is not None and filter_query is not None:
@@ -254,28 +278,38 @@ class InfinoVectorStore(BasePydanticVectorStore):
                 filter_column=kwargs.get("filter_column") or self._text_column,
                 filter_query=filter_query,
                 filter_mode=kwargs.get("filter_mode"),
-                projection=self._projection(),
+                projection=self._search_projection(),
             )
         elif query.filters is not None:
-            where = compile_filters(query.filters, self._metadata_column_names)
-            columns = ", ".join(self._projection())
-            sql = (
-                f"SELECT {columns} FROM vector_search("
-                f"{sql_lit(self._table_name)}, {sql_lit(self._vector_column)}, "
-                f"{sql_lit(vector_literal(embedding))}, "
-                f"{query.similarity_top_k * FILTER_OVERSAMPLE}) "
-                f"WHERE {where} ORDER BY {SCORE_COLUMN} ASC "
-                f"LIMIT {query.similarity_top_k}"
-            )
-            result = self._safe_query_sql(sql)
+            result = self._filtered_vector_search(query, query.filters, embedding)
         else:
             result = self._table.vector_search(
                 self._vector_column,
                 embedding,
                 query.similarity_top_k,
-                projection=self._projection(),
+                projection=self._search_projection(),
             )
         return self._to_result(result, distance_metric=True)
+
+    def _filtered_vector_search(
+        self,
+        query: VectorStoreQuery,
+        filters: MetadataFilters,
+        embedding: list[float],
+    ) -> pa.Table:
+        # vector_search has no arbitrary-WHERE param, so structured filters go
+        # through the SQL TVF: over-fetch, filter, then trim to top-k.
+        where = compile_filters(filters, self._metadata_column_names)
+        columns = ", ".join(self._search_projection())
+        vector = ",".join(str(float(x)) for x in embedding)
+        sql = (
+            f"SELECT {columns} FROM vector_search("
+            f"{quote_str(self._table_name)}, {quote_str(self._vector_column)}, "
+            f"'{vector}', {query.similarity_top_k * self._filter_oversample}) "
+            f"WHERE {where} ORDER BY {SCORE_COLUMN} ASC "
+            f"LIMIT {query.similarity_top_k}"
+        )
+        return self._query_or_empty(sql)
 
     def _text_query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
         query_str = _require_query_str(query, "TEXT_SEARCH")
@@ -283,7 +317,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
             self._text_column,
             query_str,
             query.similarity_top_k,
-            projection=self._projection(),
+            projection=self._search_projection(),
         )
         return self._to_result(result, distance_metric=False)
 
@@ -291,21 +325,18 @@ class InfinoVectorStore(BasePydanticVectorStore):
         query_str = _require_query_str(query, "HYBRID")
         embedding = _require_embedding(query)
         k = query.hybrid_top_k or query.similarity_top_k
-        columns = ", ".join(self._projection())
-        sql = (
-            f"SELECT {columns} FROM hybrid_search("
-            f"{sql_lit(self._table_name)}, {sql_lit(self._text_column)}, "
-            f"{sql_lit(query_str)}, {sql_lit(self._vector_column)}, "
-            f"{sql_lit(vector_literal(embedding))}, {k}) "
-            f"ORDER BY {SCORE_COLUMN} DESC"
+        result = self._table.hybrid_search(
+            self._text_column,
+            query_str,
+            self._vector_column,
+            embedding,
+            k,
+            projection=self._search_projection(),
         )
-        return self._to_result(self._safe_query_sql(sql), distance_metric=False)
+        return self._to_result(result, distance_metric=False)
 
-    def _mmr_query(
-        self, query: VectorStoreQuery, **kwargs: Any
-    ) -> VectorStoreQueryResult:
-        # Local imports keep llama-index-core's MMR utilities out of the import path
-        # of users who never reach for MMR.
+    def _mmr_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+        # Local import: keep MMR utils off the import path for non-MMR users.
         from llama_index.core.indices.query.embedding_utils import (
             get_top_k_mmr_embeddings,
         )
@@ -322,7 +353,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
             self._vector_column,
             query_embedding,
             fetch_k,
-            projection=self._projection(),
+            projection=self._search_projection(),
         )
         base = self._to_result(candidates, distance_metric=True)
         if not base.nodes:
@@ -341,16 +372,29 @@ class InfinoVectorStore(BasePydanticVectorStore):
         ids_list = base.ids or []
         ids = [ids_list[i] for i in selected_idx] if ids_list else []
         sims = (
-            [base.similarities[i] for i in selected_idx]
-            if base.similarities is not None
-            else None
+            [base.similarities[i] for i in selected_idx] if base.similarities is not None else None
         )
         return VectorStoreQueryResult(nodes=nodes, ids=ids, similarities=sims)
 
-    def _projection(self) -> list[str]:
-        return [*self._read_projection(), SCORE_COLUMN]
+    def _get_by_ids(self, node_ids: Sequence[str]) -> list[BaseNode]:
+        # exact_match on the unique node_id returns <=1 row, so dedup the input
+        # (preserving order) rather than the results.
+        projection = self._node_projection()
+        nodes: list[BaseNode] = []
+        for node_id in dict.fromkeys(node_ids):
+            table = self._table.exact_match(self._node_id_column, node_id, projection=projection)
+            found, _, _ = rows_to_results(
+                table,
+                node_id_column=self._node_id_column,
+                text_column=self._text_column,
+            )
+            nodes.extend(found)
+        return nodes
 
-    def _read_projection(self) -> list[str]:
+    def _search_projection(self) -> list[str]:
+        return [*self._node_projection(), SCORE_COLUMN]
+
+    def _node_projection(self) -> list[str]:
         return [
             self._node_id_column,
             self._ref_doc_id_column,
@@ -368,7 +412,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
     ) -> str | None:
         parts: list[str] = []
         if node_ids:
-            id_list = ", ".join(sql_lit(i) for i in node_ids)
+            id_list = ", ".join(quote_str(i) for i in node_ids)
             parts.append(f"{self._node_id_column} IN ({id_list})")
         if filters is not None:
             parts.append(compile_filters(filters, self._metadata_column_names))
@@ -376,13 +420,13 @@ class InfinoVectorStore(BasePydanticVectorStore):
             return None
         return " AND ".join(parts) if len(parts) > 1 else parts[0]
 
-    def _safe_query_sql(self, sql: str) -> pa.Table:
-        """Run SQL, treating the engine's empty-result signals as an empty table."""
+    def _query_or_empty(self, sql: str) -> pa.Table:
+        """Run SQL, mapping the engine's empty-table signal to an empty table."""
         try:
             return self._connection.query_sql(sql)
         except (ValueError, RuntimeError) as exc:
-            if is_empty_result_error(exc):
-                return pa.table({name: [] for name in self._read_projection()})
+            if is_empty_table_error(exc):
+                return pa.table({name: [] for name in self._node_projection()})
             raise
 
     def _append(self, nodes: Sequence[BaseNode], ids: Sequence[str]) -> None:
@@ -403,21 +447,10 @@ class InfinoVectorStore(BasePydanticVectorStore):
     def _delete_node_ids(self, ids: Sequence[str]) -> None:
         if not ids:
             return
-        id_list = ", ".join(sql_lit(i) for i in ids)
-        self._safe_delete(f"{self._node_id_column} IN ({id_list})")
+        id_list = ", ".join(quote_str(i) for i in ids)
+        self._table.delete(f"{self._node_id_column} IN ({id_list})")
 
-    def _safe_delete(self, predicate: str) -> None:
-        """``Table.delete`` requires durable storage; memory connections no-op."""
-        try:
-            self._table.delete(predicate)
-        except RuntimeError as exc:
-            if is_no_storage_error(exc):
-                return
-            raise
-
-    def _to_result(
-        self, table: pa.Table, *, distance_metric: bool
-    ) -> VectorStoreQueryResult:
+    def _to_result(self, table: pa.Table, *, distance_metric: bool) -> VectorStoreQueryResult:
         nodes, ids, scores = rows_to_results(
             table,
             node_id_column=self._node_id_column,
@@ -480,7 +513,7 @@ def _require_query_str(query: VectorStoreQuery, mode: str) -> str:
 
 
 def _distance_to_similarity(metric: Metric, distance: float) -> float:
-    """Map raw distance into a [0, 1] relevance where higher is better."""
+    """Map a raw distance into a [0, 1] relevance where higher is better."""
     if metric == "cosine":
         return max(0.0, min(1.0, 1.0 - distance))
     if metric in ("l2", "l2sq"):

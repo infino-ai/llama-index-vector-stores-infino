@@ -1,6 +1,6 @@
 """Arrow + SQL helpers shared by the store.
 
-Schema contract — column names and SQL-quoting rules — lives here.
+The schema contract — column names and SQL-quoting rules — lives here.
 """
 
 from __future__ import annotations
@@ -19,24 +19,24 @@ NODE_CONTENT_COLUMN = "_node_content"
 NODE_TYPE_COLUMN = "_node_type"
 SCORE_COLUMN = "score"
 
-# Engine raises one of these when a SQL query returns no rows or the table
-# has not been written to yet; both mean "no data" to the integration.
-_EMPTY_RESULT_MARKERS = ("at least one RecordBatch", "manifest load error")
+# Raw row-returning SELECTs on a never-written table raise this; the direct
+# Table methods return empty cleanly. Shim until the engine does the same.
+_EMPTY_TABLE_MARKERS = ("at least one RecordBatch", "manifest load error")
 
 
-def sql_lit(value: str) -> str:
-    """Quote a string as a SQL literal."""
+def quote_str(value: str) -> str:
+    """Quote a string as a SQL literal, escaping embedded single quotes."""
     return "'" + value.replace("'", "''") + "'"
 
 
-def sql_literal(value: Any) -> str:
-    """Render any filter value as a SQL literal."""
+def sql_value(value: Any) -> str:
+    """Render a typed filter value as a SQL literal."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, str):
-        return sql_lit(value)
+        return quote_str(value)
     raise TypeError(f"unsupported filter value type: {type(value).__name__}")
 
 
@@ -45,21 +45,8 @@ def vector_array(vectors: Sequence[Sequence[float]], dim: int) -> pa.Array:
     return pa.array(vectors, type=pa.list_(pa.float32(), dim))
 
 
-def vector_literal(embedding: Sequence[float]) -> str:
-    """Render an embedding as the SQL TVF accepts (comma-separated floats)."""
-    return ",".join(str(float(x)) for x in embedding)
-
-
-def encode_node(
-    node: BaseNode,
-    declared_keys: Sequence[str],
-) -> dict[str, Any]:
-    """Project a node onto the store's columns.
-
-    Returns a dict keyed by user-facing field names: ``text``, ``embedding``,
-    ``ref_doc_id``, the declared metadata keys, plus the two ``_node_*``
-    catch-alls. Caller adds the ``node_id``.
-    """
+def encode_node(node: BaseNode, declared_keys: Sequence[str]) -> dict[str, Any]:
+    """Project a node onto the store's columns (caller adds ``node_id``)."""
     metadata = node_to_metadata_dict(node, remove_text=True)
     return {
         "text": node.get_content(metadata_mode=MetadataMode.NONE),
@@ -67,19 +54,15 @@ def encode_node(
         "ref_doc_id": node.ref_doc_id or "",
         **{k: node.metadata.get(k) for k in declared_keys},
         NODE_CONTENT_COLUMN: metadata[NODE_CONTENT_COLUMN],
-        NODE_TYPE_COLUMN: metadata["_node_type"],
+        NODE_TYPE_COLUMN: metadata[NODE_TYPE_COLUMN],
     }
 
 
-def decode_node(
-    row: dict[str, Any],
-    *,
-    text_column: str,
-) -> BaseNode:
-    """Rebuild a node from a result row's columns."""
+def decode_node(row: dict[str, Any], *, text_column: str) -> BaseNode:
+    """Rebuild a node from a result row, falling back to a bare TextNode."""
     payload = {
-        "_node_content": row[NODE_CONTENT_COLUMN],
-        "_node_type": row[NODE_TYPE_COLUMN],
+        NODE_CONTENT_COLUMN: row[NODE_CONTENT_COLUMN],
+        NODE_TYPE_COLUMN: row[NODE_TYPE_COLUMN],
     }
     try:
         return metadata_dict_to_node(payload, text=row[text_column])
@@ -93,7 +76,7 @@ def rows_to_results(
     node_id_column: str,
     text_column: str,
 ) -> tuple[list[BaseNode], list[str], list[float] | None]:
-    """Convert an Arrow result into LlamaIndex's ``VectorStoreQueryResult`` triple."""
+    """Convert an Arrow result into LlamaIndex's node/id/score triple."""
     n = table.num_rows
     if n == 0:
         return [], [], None
@@ -106,23 +89,13 @@ def rows_to_results(
     for i in range(n):
         row = {name: vals[i] for name, vals in cols.items()}
         node = decode_node(row, text_column=text_column)
-        node_id = cast(str, row.get(node_id_column) or node.node_id)
-        ids.append(node_id)
+        ids.append(cast(str, row.get(node_id_column) or node.node_id))
         nodes.append(node)
     return nodes, ids, scores
 
 
-def is_empty_result_error(exc: BaseException) -> bool:
+def is_empty_table_error(exc: BaseException) -> bool:
     """Whether ``exc`` is the engine's "no rows / never-written" signal."""
     if not isinstance(exc, (ValueError, RuntimeError)):
         return False
-    msg = str(exc)
-    return any(marker in msg for marker in _EMPTY_RESULT_MARKERS)
-
-
-def is_no_storage_error(exc: BaseException) -> bool:
-    """``memory://`` connections raise this from delete / update; treat as no-op."""
-    return (
-        isinstance(exc, RuntimeError)
-        and "no storage attached" in str(exc)
-    )
+    return any(marker in str(exc) for marker in _EMPTY_TABLE_MARKERS)

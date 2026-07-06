@@ -15,7 +15,7 @@ from llama_index.core.vector_stores.types import (
     MetadataFilters,
 )
 
-from llama_index.vector_stores.infino._arrow import sql_lit, sql_literal
+from llama_index.vector_stores.infino._arrow import quote_str, sql_value
 
 _BINARY_OPERATORS: dict[FilterOperator, str] = {
     FilterOperator.EQ: "=",
@@ -73,15 +73,15 @@ def _compile_comparison(f: MetadataFilter) -> str:
     value = f.value
 
     if op in _BINARY_OPERATORS:
-        return f"{key} {_BINARY_OPERATORS[op]} {sql_literal(value)}"
+        return f"{key} {_BINARY_OPERATORS[op]} {sql_value(value)}"
     if op in (FilterOperator.IN, FilterOperator.ANY):
-        items = ", ".join(sql_literal(v) for v in _as_list(value))
+        items = ", ".join(sql_value(v) for v in _as_list(value))
         return f"{key} IN ({items})"
     if op == FilterOperator.NIN:
-        items = ", ".join(sql_literal(v) for v in _as_list(value))
+        items = ", ".join(sql_value(v) for v in _as_list(value))
         return f"{key} NOT IN ({items})"
     if op == FilterOperator.ALL:
-        parts = [f"{key} = {sql_literal(v)}" for v in _as_list(value)]
+        parts = [f"{key} = {sql_value(v)}" for v in _as_list(value)]
         return " AND ".join(parts) if parts else "TRUE"
     if op == FilterOperator.CONTAINS:
         return _like(key, _as_str(value), case_sensitive=True)
@@ -97,7 +97,7 @@ def _compile_comparison(f: MetadataFilter) -> str:
 def _like(key: str, value: str, *, case_sensitive: bool) -> str:
     pattern = "%" + _escape_like(value) + "%"
     op = "LIKE" if case_sensitive else "ILIKE"
-    return f"{key} {op} {sql_lit(pattern)} ESCAPE '\\'"
+    return f"{key} {op} {quote_str(pattern)} ESCAPE '\\'"
 
 
 def _escape_like(value: str) -> str:
