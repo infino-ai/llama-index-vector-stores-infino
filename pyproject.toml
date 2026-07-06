@@ -49,6 +49,13 @@ Changelog = "https://github.com/infino-ai/llama-index-vector-stores-infino/relea
 test = ["pytest", "pytest-asyncio"]
 lint = ["ruff", "mypy"]
 
+[tool.codespell]
+check-filenames = true
+check-hidden = true
+# NIN = LlamaIndex FilterOperator.NIN (not-in), not a typo.
+ignore-words-list = "nin"
+skip = "*.csv,*.html,*.json,*.jsonl,*.pdf,*.txt,*.ipynb,*.lock"
+
 [tool.hatch.build.targets.sdist]
 include = ["llama_index/"]
 
