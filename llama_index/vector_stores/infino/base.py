@@ -28,7 +28,6 @@ from llama_index.vector_stores.infino._arrow import (
     NODE_TYPE_COLUMN,
     SCORE_COLUMN,
     encode_node,
-    is_empty_table_error,
     quote_str,
     rows_to_results,
     vector_array,
@@ -178,7 +177,9 @@ class InfinoVectorStore(BasePydanticVectorStore):
             return self._get_by_ids(node_ids)
         predicate = self._where(node_ids=node_ids, filters=filters) or "TRUE"
         columns = ", ".join(self._node_projection())
-        table = self._query_or_empty(f"SELECT {columns} FROM {self._table_name} WHERE {predicate}")
+        table = self._connection.query_sql(
+            f"SELECT {columns} FROM {self._table_name} WHERE {predicate}"
+        )
         nodes, _, _ = rows_to_results(
             table,
             node_id_column=self._node_id_column,
@@ -198,12 +199,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
 
     def count(self) -> int:
         """Total row count."""
-        try:
-            table = self._connection.query_sql(f"SELECT COUNT(*) AS n FROM {self._table_name}")
-        except (ValueError, RuntimeError) as exc:
-            if is_empty_table_error(exc):
-                return 0
-            raise
+        table = self._connection.query_sql(f"SELECT COUNT(*) AS n FROM {self._table_name}")
         return int(table.column("n")[0].as_py())
 
     def optimize(self) -> None:
@@ -260,7 +256,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
         text, declared metadata, the two ``_node_*`` catch-alls) and, for
         ranking, ``score``.
         """
-        return self._to_result(self._query_or_empty(sql), distance_metric=False)
+        return self._to_result(self._connection.query_sql(sql), distance_metric=False)
 
     def _vector_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         embedding = _require_embedding(query)
@@ -309,7 +305,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
             f"WHERE {where} ORDER BY {SCORE_COLUMN} ASC "
             f"LIMIT {query.similarity_top_k}"
         )
-        return self._query_or_empty(sql)
+        return self._connection.query_sql(sql)
 
     def _text_query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
         query_str = _require_query_str(query, "TEXT_SEARCH")
@@ -419,15 +415,6 @@ class InfinoVectorStore(BasePydanticVectorStore):
         if not parts:
             return None
         return " AND ".join(parts) if len(parts) > 1 else parts[0]
-
-    def _query_or_empty(self, sql: str) -> pa.Table:
-        """Run SQL, mapping the engine's empty-table signal to an empty table."""
-        try:
-            return self._connection.query_sql(sql)
-        except (ValueError, RuntimeError) as exc:
-            if is_empty_table_error(exc):
-                return pa.table({name: [] for name in self._node_projection()})
-            raise
 
     def _append(self, nodes: Sequence[BaseNode], ids: Sequence[str]) -> None:
         rows = [encode_node(n, self._metadata_column_names) for n in nodes]

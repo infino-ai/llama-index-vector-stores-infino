@@ -8,7 +8,6 @@ from llama_index.vector_stores.infino._arrow import (
     NODE_TYPE_COLUMN,
     SCORE_COLUMN,
     encode_node,
-    is_empty_table_error,
     quote_str,
     rows_to_results,
     sql_value,
@@ -63,11 +62,3 @@ def test_rows_to_results_handles_empty_table():
     empty = pa.table({"node_id": [], "text": []})
     nodes, ids, scores = rows_to_results(empty, node_id_column="node_id", text_column="text")
     assert nodes == [] and ids == [] and scores is None
-
-
-def test_is_empty_table_error_recognizes_engine_signals():
-    assert is_empty_table_error(ValueError("Must pass schema, or at least one RecordBatch"))
-    assert is_empty_table_error(RuntimeError("manifest load error"))
-    assert is_empty_table_error(ValueError("Error during planning: backend: manifest load error"))
-    assert not is_empty_table_error(KeyError("nope"))
-    assert not is_empty_table_error(ValueError("unrelated"))

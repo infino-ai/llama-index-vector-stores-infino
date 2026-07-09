@@ -19,10 +19,6 @@ NODE_CONTENT_COLUMN = "_node_content"
 NODE_TYPE_COLUMN = "_node_type"
 SCORE_COLUMN = "score"
 
-# Raw row-returning SELECTs on a never-written table raise this; the direct
-# Table methods return empty cleanly. Shim until the engine does the same.
-_EMPTY_TABLE_MARKERS = ("at least one RecordBatch", "manifest load error")
-
 
 def quote_str(value: str) -> str:
     """Quote a string as a SQL literal, escaping embedded single quotes."""
@@ -92,10 +88,3 @@ def rows_to_results(
         ids.append(cast(str, row.get(node_id_column) or node.node_id))
         nodes.append(node)
     return nodes, ids, scores
-
-
-def is_empty_table_error(exc: BaseException) -> bool:
-    """Whether ``exc`` is the engine's "no rows / never-written" signal."""
-    if not isinstance(exc, (ValueError, RuntimeError)):
-        return False
-    return any(marker in str(exc) for marker in _EMPTY_TABLE_MARKERS)

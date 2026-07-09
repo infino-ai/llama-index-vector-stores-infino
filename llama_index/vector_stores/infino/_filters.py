@@ -83,9 +83,7 @@ def _compile_comparison(f: MetadataFilter) -> str:
     if op == FilterOperator.ALL:
         parts = [f"{key} = {sql_value(v)}" for v in _as_list(value)]
         return " AND ".join(parts) if parts else "TRUE"
-    if op == FilterOperator.CONTAINS:
-        return _like(key, _as_str(value), case_sensitive=True)
-    if op == FilterOperator.TEXT_MATCH:
+    if op in (FilterOperator.CONTAINS, FilterOperator.TEXT_MATCH):
         return _like(key, _as_str(value), case_sensitive=True)
     if op == FilterOperator.TEXT_MATCH_INSENSITIVE:
         return _like(key, _as_str(value), case_sensitive=False)
