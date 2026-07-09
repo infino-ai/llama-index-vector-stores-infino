@@ -10,4 +10,4 @@
 - CRUD: `add` (upsert by `node_id`), `delete` (by `ref_doc_id`),
   `delete_nodes`, `get_nodes`, `clear`, plus `count` / `optimize` / `gc`.
 - Async siblings for all mutating and query methods.
-- Requires `infino>=0.1.4`.
+- Requires `infino>=0.1.5`.

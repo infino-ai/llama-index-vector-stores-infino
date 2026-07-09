@@ -33,7 +33,7 @@ classifiers = [
 ]
 dependencies = [
     "llama-index-core>=0.13,<0.15",
-    "infino>=0.1.4",
+    "infino>=0.1.5",
     "pyarrow>=14",
     "numpy>=1.26",
 ]
