@@ -21,10 +21,14 @@ on:
         default: testpypi
         type: choice
         options: [testpypi, pypi]
+  # A published GitHub Release auto-publishes to PyPI; the version comes from
+  # the release tag (leading "v" stripped). Manual dispatch above is unchanged.
+  release:
+    types: [published]
 
 # One release per index at a time; never cancel a publish in flight.
 concurrency:
-  group: publish-${{ inputs.target }}
+  group: publish-${{ inputs.target || 'pypi' }}
   cancel-in-progress: false
 
 # Least privilege by default; the publish job widens to `id-token: write` for
@@ -40,13 +44,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - id: check
-        name: Validate version
+        name: Resolve and validate version
         run: |
-          version="${{ inputs.version }}"
+          # Manual dispatch supplies `version`; a release event supplies the tag.
+          version="${{ inputs.version || github.event.release.tag_name }}"
+          version="${version#v}"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-]?(a|b|rc|alpha|beta|post|dev)[0-9]+)?$ ]]; then
             echo "::error::invalid release version (must be PEP 440): $version"
             exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-python@v5
         with:
@@ -56,7 +63,7 @@ jobs:
       # built artifacts carry the release version.
       - name: Stamp version
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.check.outputs.version }}
         run: |
           python3 - "$VERSION" <<'PY'
           import pathlib, re, sys
@@ -91,7 +98,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish to ${{ inputs.target }}
+    name: Publish to ${{ inputs.target || 'pypi' }}
     needs: build
     runs-on: ubuntu-latest
     # `environment` is load-bearing, not decoration: the PyPI/TestPyPI trusted
@@ -101,7 +108,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    environment: ${{ inputs.target }}
+    environment: ${{ inputs.target || 'pypi' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -116,8 +123,8 @@ jobs:
           python3 -m twine check dist/*
       # Trusted Publishing: no `password` — the action exchanges the OIDC token
       # with the index. `repository-url` selects PyPI vs TestPyPI.
-      - name: Upload to ${{ inputs.target }}
+      - name: Upload to ${{ inputs.target || 'pypi' }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-          repository-url: ${{ inputs.target == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          repository-url: ${{ (inputs.target || 'pypi') == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}

@@ -482,7 +482,7 @@ def _open_or_create(
         .fts(schema.field(0).name)  # node_id
         .fts(schema.field(1).name)  # ref_doc_id
         .fts(schema.field(2).name)  # text
-        .vector(schema.field(3).name, schema.field(3).type.list_size, n_cent, metric)
+        .vector(schema.field(3).name, schema.field(3).type.list_size, metric)
     )
     return connection.create_table(table_name, schema, indexes)
 

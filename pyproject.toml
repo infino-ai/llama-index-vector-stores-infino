@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llama-index-vector-stores-infino"
-version = "0.1.0"
+version = "0.2.0"
 description = "LlamaIndex integration for Infino — vector, BM25, hybrid (RRF), and SQL retrieval over one engine on object storage."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
@@ -33,7 +33,7 @@ classifiers = [
 ]
 dependencies = [
     "llama-index-core>=0.13,<0.15",
-    "infino>=0.1.5",
+    "infino>=0.7,<0.8",
     "pyarrow>=14",
     "numpy>=1.26",
 ]
