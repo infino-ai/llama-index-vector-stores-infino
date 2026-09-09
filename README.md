@@ -53,6 +53,30 @@ index = VectorStoreIndex.from_documents(
 retriever = index.as_retriever(similarity_top_k=4)
 ```
 
+## Connecting: local, object storage, or hosted cloud
+
+The store construction is identical in every case — only the `infino.connect(...)`
+call differs:
+
+```python
+import infino
+
+# Local (embedded): Parquet under a directory, no server.
+connection = infino.connect("./data")
+
+# Object storage (embedded): Parquet in your bucket, queried in place.
+connection = infino.connect(
+    "s3://my-bucket/rag", storage_options={"aws_region": "us-east-1"}
+)
+
+# Hosted Infino Cloud: sign up at https://platform.infino.ws for an API key.
+connection = infino.connect(
+    "https://api.platform.infino.ws/<database>", api_key="..."
+)
+
+store = InfinoVectorStore(connection, table_name="docs", dim=384)
+```
+
 ## Core concepts
 
 - **`InfinoVectorStore`** wraps a single Infino table — the text, its
