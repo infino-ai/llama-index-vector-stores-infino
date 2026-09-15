@@ -64,6 +64,8 @@ class InfinoVectorStore(BasePydanticVectorStore):
             the rest round-trips via the JSON catch-all. Fixed at creation.
         n_cent: IVF centroid count (engine-clamped on small tables).
         filter_oversample: over-fetch multiplier for structured-filter queries.
+            A selective filter can return fewer than top-k rows; raise it to
+            widen the pool.
     """
 
     stores_text: bool = True

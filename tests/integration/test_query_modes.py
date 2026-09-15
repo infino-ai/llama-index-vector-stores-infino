@@ -150,8 +150,8 @@ def test_hybrid_applies_structured_filter(store, seeded_nodes):
             ),
         )
     )
-    assert {n.node_id for n in result.nodes} <= {"n1", "n3"}
-    assert result.nodes
+    # Exactly the tech rows: pins the filter, not just the ranking.
+    assert {n.node_id for n in result.nodes} == {"n1", "n3"}
 
 
 @pytest.mark.parametrize(
