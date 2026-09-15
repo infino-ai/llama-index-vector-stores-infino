@@ -508,7 +508,15 @@ def _open_or_create(
     metric: Metric,
 ) -> infino.Table:
     if table_name in connection.list_tables():
-        return connection.open_table(table_name)
+        table = connection.open_table(table_name)
+        stored = table.schema()
+        if not stored.equals(schema):
+            raise ValueError(
+                f"table {table_name!r} exists with a different schema — `dim` and "
+                f"`metadata_columns` are fixed at creation: "
+                + "; ".join(_schema_mismatch(stored, schema))
+            )
+        return table
     indexes = (
         infino.IndexSpec()
         .fts(schema.field(0).name)  # node_id
@@ -523,6 +531,17 @@ def _require_embedding(query: VectorStoreQuery) -> list[float]:
     if query.query_embedding is None:
         raise ValueError("query.query_embedding is required for this mode")
     return list(query.query_embedding)
+
+
+def _schema_mismatch(stored: pa.Schema, declared: pa.Schema) -> list[str]:
+    """Describe each column whose type differs or is missing on one side."""
+    mismatches = []
+    for name in dict.fromkeys([*stored.names, *declared.names]):
+        s = stored.field(name).type if name in stored.names else None
+        d = declared.field(name).type if name in declared.names else None
+        if s != d:
+            mismatches.append(f"{name} (stored {s}, declared {d})")
+    return mismatches
 
 
 def _vector_literal(embedding: Sequence[float]) -> str:
