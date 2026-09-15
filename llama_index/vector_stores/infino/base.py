@@ -521,6 +521,7 @@ def _open_or_create(
                 f"table {table_name!r} exists with a different schema — `dim` and "
                 f"`metadata_columns` are fixed at creation: "
                 + "; ".join(_schema_mismatch(stored, schema))
+                + ". Open it with the stored schema, or create a new table for the new shape."
             )
         return table
     indexes = (

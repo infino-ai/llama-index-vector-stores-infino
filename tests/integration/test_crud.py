@@ -121,5 +121,6 @@ def test_reopen_with_matching_schema_succeeds(tmp_connection):
 )
 def test_reopen_with_mismatched_schema_raises(tmp_connection, kwargs, expected):
     InfinoVectorStore(tmp_connection, "fixed", dim=DIM)
-    with pytest.raises(ValueError, match=expected):
+    with pytest.raises(ValueError, match=expected) as excinfo:
         InfinoVectorStore(tmp_connection, "fixed", **kwargs)
+    assert "create a new table" in str(excinfo.value)
