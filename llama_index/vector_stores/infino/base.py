@@ -215,9 +215,9 @@ class InfinoVectorStore(BasePydanticVectorStore):
         if mode == VectorStoreQueryMode.DEFAULT:
             return self._vector_query(query, **kwargs)
         if mode == VectorStoreQueryMode.TEXT_SEARCH:
-            return self._text_query(query)
+            return self._text_query(query, **kwargs)
         if mode == VectorStoreQueryMode.HYBRID:
-            return self._hybrid_query(query)
+            return self._hybrid_query(query, **kwargs)
         if mode == VectorStoreQueryMode.MMR:
             return self._mmr_query(query, **kwargs)
         raise NotImplementedError(f"query mode {mode!r} is not supported")
@@ -277,7 +277,15 @@ class InfinoVectorStore(BasePydanticVectorStore):
                 projection=self._search_projection(),
             )
         elif query.filters is not None:
-            result = self._filtered_vector_search(query, query.filters, embedding)
+            result = self._filtered_search(
+                f"vector_search({quote_str(self._table_name)}, "
+                f"{quote_str(self._vector_column)}, "
+                f"{quote_str(_vector_literal(embedding))}, "
+                f"{self._fetch_k(query.similarity_top_k)})",
+                query.filters,
+                query.similarity_top_k,
+                ascending=True,
+            )
         else:
             result = self._table.vector_search(
                 self._vector_column,
@@ -287,48 +295,72 @@ class InfinoVectorStore(BasePydanticVectorStore):
             )
         return self._to_result(result, distance_metric=True)
 
-    def _filtered_vector_search(
+    def _fetch_k(self, top_k: int) -> int:
+        return top_k * self._filter_oversample
+
+    def _filtered_search(
         self,
-        query: VectorStoreQuery,
+        tvf: str,
         filters: MetadataFilters,
-        embedding: list[float],
+        top_k: int,
+        *,
+        ascending: bool,
     ) -> pa.Table:
-        # vector_search has no arbitrary-WHERE param, so structured filters go
-        # through the SQL TVF: over-fetch, filter, then trim to top-k.
+        # The search TVFs take no WHERE, so the caller over-fetches and this
+        # filters and trims. Selective filters need a larger `filter_oversample`.
         where = compile_filters(filters, self._metadata_column_names)
         columns = ", ".join(self._search_projection())
-        vector = ",".join(str(float(x)) for x in embedding)
-        sql = (
-            f"SELECT {columns} FROM vector_search("
-            f"{quote_str(self._table_name)}, {quote_str(self._vector_column)}, "
-            f"'{vector}', {query.similarity_top_k * self._filter_oversample}) "
-            f"WHERE {where} ORDER BY {SCORE_COLUMN} ASC "
-            f"LIMIT {query.similarity_top_k}"
+        order = "ASC" if ascending else "DESC"
+        return self._connection.query_sql(
+            f"SELECT {columns} FROM {tvf} WHERE {where} "
+            f"ORDER BY {SCORE_COLUMN} {order} LIMIT {top_k}"
         )
-        return self._connection.query_sql(sql)
 
-    def _text_query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
+    def _text_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         query_str = _require_query_str(query, "TEXT_SEARCH")
-        result = self._table.bm25_search(
-            self._text_column,
-            query_str,
-            query.similarity_top_k,
-            projection=self._search_projection(),
-        )
+        _reject_pushdown(kwargs, "TEXT_SEARCH")
+        if query.filters is not None:
+            result = self._filtered_search(
+                f"bm25_search({quote_str(self._table_name)}, "
+                f"{quote_str(self._text_column)}, {quote_str(query_str)}, "
+                f"{self._fetch_k(query.similarity_top_k)})",
+                query.filters,
+                query.similarity_top_k,
+                ascending=False,
+            )
+        else:
+            result = self._table.bm25_search(
+                self._text_column,
+                query_str,
+                query.similarity_top_k,
+                projection=self._search_projection(),
+            )
         return self._to_result(result, distance_metric=False)
 
-    def _hybrid_query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
+    def _hybrid_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         query_str = _require_query_str(query, "HYBRID")
         embedding = _require_embedding(query)
+        _reject_pushdown(kwargs, "HYBRID")
         k = query.hybrid_top_k or query.similarity_top_k
-        result = self._table.hybrid_search(
-            self._text_column,
-            query_str,
-            self._vector_column,
-            embedding,
-            k,
-            projection=self._search_projection(),
-        )
+        if query.filters is not None:
+            result = self._filtered_search(
+                f"hybrid_search({quote_str(self._table_name)}, "
+                f"{quote_str(self._text_column)}, {quote_str(query_str)}, "
+                f"{quote_str(self._vector_column)}, "
+                f"{quote_str(_vector_literal(embedding))}, {self._fetch_k(k)})",
+                query.filters,
+                k,
+                ascending=False,
+            )
+        else:
+            result = self._table.hybrid_search(
+                self._text_column,
+                query_str,
+                self._vector_column,
+                embedding,
+                k,
+                projection=self._search_projection(),
+            )
         return self._to_result(result, distance_metric=False)
 
     def _mmr_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
@@ -491,6 +523,18 @@ def _require_embedding(query: VectorStoreQuery) -> list[float]:
     if query.query_embedding is None:
         raise ValueError("query.query_embedding is required for this mode")
     return list(query.query_embedding)
+
+
+def _vector_literal(embedding: Sequence[float]) -> str:
+    return ",".join(str(float(x)) for x in embedding)
+
+
+def _reject_pushdown(kwargs: dict[str, Any], mode: str) -> None:
+    if kwargs.get("filter_query") is not None:
+        raise ValueError(
+            f"`filter_query` is a vector-search pushdown and does not apply to "
+            f"{mode}; use `query.filters` instead"
+        )
 
 
 def _require_query_str(query: VectorStoreQuery, mode: str) -> str:

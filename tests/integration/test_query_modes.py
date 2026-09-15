@@ -122,3 +122,45 @@ def test_empty_table_returns_empty_results(store):
     result = store.query(_query(query_embedding=vec(0.10)))
     assert result.nodes == []
     assert result.ids == []
+
+
+def test_text_search_applies_structured_filter(store, seeded_nodes):
+    store.add(seeded_nodes)
+    result = store.query(
+        _query(
+            query_str="billing",
+            mode=VectorStoreQueryMode.TEXT_SEARCH,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="year", value=2024)]
+            ),
+        )
+    )
+    assert {n.node_id for n in result.nodes} == {"n4"}
+
+
+def test_hybrid_applies_structured_filter(store, seeded_nodes):
+    store.add(seeded_nodes)
+    result = store.query(
+        _query(
+            query_str="billing",
+            query_embedding=vec(0.30),
+            mode=VectorStoreQueryMode.HYBRID,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value="tech")]
+            ),
+        )
+    )
+    assert {n.node_id for n in result.nodes} <= {"n1", "n3"}
+    assert result.nodes
+
+
+@pytest.mark.parametrize(
+    "mode", [VectorStoreQueryMode.TEXT_SEARCH, VectorStoreQueryMode.HYBRID]
+)
+def test_filter_query_rejected_outside_vector_search(store, seeded_nodes, mode):
+    store.add(seeded_nodes)
+    with pytest.raises(ValueError, match="filter_query"):
+        store.query(
+            _query(query_str="billing", query_embedding=vec(0.30), mode=mode),
+            filter_query="billing",
+        )
