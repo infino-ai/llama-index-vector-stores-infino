@@ -152,9 +152,8 @@ retriever = index.as_retriever(
 ## Text-pushdown pre-filter
 
 For a *text* predicate, push it into the kNN instead of post-filtering the
-top-k. The engine prunes to rows matching the full-text terms **before**
-ranking, so exactly `k` nearest *matching* rows come back — no over-fetch.
-Pass it via `vector_store_kwargs`:
+top-k. The engine ranks only rows matching the full-text terms, so no
+over-fetch is needed. Pass it via `vector_store_kwargs`:
 
 ```python
 retriever = index.as_retriever(
@@ -165,6 +164,14 @@ retriever = index.as_retriever(
 
 `filters` (structured, post-rank `WHERE`) and `filter_query` (text,
 pre-rank pushdown) are distinct paths and not combinable in one call.
+`filter_query` applies to vector search only; the other modes raise.
+
+Both paths can return fewer than `k` rows when the predicate is selective.
+`filters` runs over a `similarity_top_k * filter_oversample` candidate pool
+(10x by default) — raise `filter_oversample` when a filter matches a small
+fraction of the table. `filter_query` ranks within the probed vector cells,
+so matches scattered across the index can be missed; use `search_by_sql` over
+`bm25_search` when every matching row must come back.
 
 ## SQL escape hatch
 
