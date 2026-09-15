@@ -189,3 +189,65 @@ def test_mmr_applies_filter_query_pushdown(store, seeded_nodes, embed_model):
         filter_query="billing",
     )
     assert {n.node_id for n in result.nodes} == {"n2", "n4"}
+
+
+@pytest.fixture
+def many_nodes():
+    """600 rows where `category` "rare" holds 12 — too few for a 10x pool."""
+    from tests.integration.conftest import make_node
+
+    nodes = []
+    for i in range(600):
+        category = "rare" if i % 50 == 0 else "common"
+        nodes.append(
+            make_node(
+                f"row {i} lorem ipsum",
+                id_=f"m{i}",
+                embedding=vec(i / 600),
+                metadata={"category": category, "year": 2000 + (i % 10)},
+            )
+        )
+    return nodes
+
+
+def test_selective_filter_still_fills_top_k(store, many_nodes):
+    store.add(many_nodes)
+    result = store.query(
+        _query(
+            query_embedding=vec(0.99),
+            similarity_top_k=10,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value="rare")]
+            ),
+        )
+    )
+    assert len(result.nodes) == 10
+    assert all(n.metadata["category"] == "rare" for n in result.nodes)
+
+
+def test_filter_matching_fewer_than_k_returns_all_matches(store, many_nodes):
+    store.add(many_nodes)
+    result = store.query(
+        _query(
+            query_embedding=vec(0.99),
+            similarity_top_k=20,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value="rare")]
+            ),
+        )
+    )
+    assert len(result.nodes) == 12
+
+
+def test_filter_matching_nothing_returns_empty(store, many_nodes):
+    store.add(many_nodes)
+    result = store.query(
+        _query(
+            query_embedding=vec(0.99),
+            similarity_top_k=10,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value="absent")]
+            ),
+        )
+    )
+    assert result.nodes == []

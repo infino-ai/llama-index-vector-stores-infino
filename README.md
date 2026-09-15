@@ -153,7 +153,7 @@ retriever = index.as_retriever(
 
 For a *text* predicate, push it into the kNN instead of post-filtering the
 top-k. The engine prunes to rows matching the full-text terms **before**
-ranking, so exactly `k` nearest *matching* rows come back — no over-fetch.
+ranking, so no over-fetch is needed.
 Pass it via `vector_store_kwargs`:
 
 ```python

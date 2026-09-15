@@ -8,7 +8,7 @@ and SQL retrieval all run over it.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, ClassVar, Literal
 
 import pyarrow as pa
@@ -47,6 +47,8 @@ DEFAULT_N_CENT = 64
 DEFAULT_MMR_FETCH_K = 20
 # Structured filters run post-rank, so over-fetch from the vector TVF and trim.
 DEFAULT_FILTER_OVERSAMPLE = 10
+# Pool growth per retry when a selective filter leaves fewer than top-k.
+FILTER_WIDEN_FACTOR = 4
 
 
 class InfinoVectorStore(BasePydanticVectorStore):
@@ -63,9 +65,8 @@ class InfinoVectorStore(BasePydanticVectorStore):
         metadata_columns: metadata keys promoted to filterable scalar columns;
             the rest round-trips via the JSON catch-all. Fixed at creation.
         n_cent: IVF centroid count (engine-clamped on small tables).
-        filter_oversample: over-fetch multiplier for structured-filter queries.
-            A selective filter can return fewer than top-k rows; raise it to
-            widen the pool.
+        filter_oversample: initial over-fetch multiplier for structured-filter
+            queries; widened automatically until the top-k is filled.
     """
 
     stores_text: bool = True
@@ -291,10 +292,11 @@ class InfinoVectorStore(BasePydanticVectorStore):
             )
         if query.filters is not None:
             return self._filtered_search(
-                f"vector_search({quote_str(self._table_name)}, "
-                f"{quote_str(self._vector_column)}, "
-                f"{quote_str(_vector_literal(embedding))}, "
-                f"{self._fetch_k(top_k)})",
+                lambda fetch: (
+                    f"vector_search({quote_str(self._table_name)}, "
+                    f"{quote_str(self._vector_column)}, "
+                    f"{quote_str(_vector_literal(embedding))}, {fetch})"
+                ),
                 query.filters,
                 top_k,
                 ascending=True,
@@ -311,30 +313,54 @@ class InfinoVectorStore(BasePydanticVectorStore):
 
     def _filtered_search(
         self,
-        tvf: str,
+        tvf: Callable[[int], str],
         filters: MetadataFilters,
         top_k: int,
         *,
         ascending: bool,
     ) -> pa.Table:
-        # The search TVFs take no WHERE, so the caller over-fetches and this
-        # filters and trims. Selective filters need a larger `filter_oversample`.
+        # The search TVFs take no WHERE, so over-fetch, filter, then trim. A
+        # selective filter can leave fewer than top_k, so widen the pool until
+        # it doesn't, or until the pool covers the table.
         where = compile_filters(filters, self._metadata_column_names)
         columns = ", ".join(self._search_projection())
         order = "ASC" if ascending else "DESC"
-        return self._connection.query_sql(
-            f"SELECT {columns} FROM {tvf} WHERE {where} "
-            f"ORDER BY {SCORE_COLUMN} {order} LIMIT {top_k}"
+        fetch = self._fetch_k(top_k)
+        wanted = top_k
+        total: int | None = None
+        while True:
+            result = self._connection.query_sql(
+                f"SELECT {columns} FROM {tvf(fetch)} WHERE {where} "
+                f"ORDER BY {SCORE_COLUMN} {order} LIMIT {top_k}"
+            )
+            if result.num_rows >= wanted:
+                return result
+            if total is None:
+                total, matching = self._filter_counts(where)
+                wanted = min(top_k, matching)
+                if result.num_rows >= wanted:
+                    return result
+            if fetch >= total:
+                return result
+            fetch = min(fetch * FILTER_WIDEN_FACTOR, total)
+
+    def _filter_counts(self, where: str) -> tuple[int, int]:
+        """Total rows and rows matching ``where``, in one pass."""
+        table = self._connection.query_sql(
+            f"SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE {where}) AS matching "
+            f"FROM {self._table_name}"
         )
+        return int(table.column("total")[0].as_py()), int(table.column("matching")[0].as_py())
 
     def _text_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         query_str = _require_query_str(query, "TEXT_SEARCH")
         _reject_pushdown(kwargs, "TEXT_SEARCH")
         if query.filters is not None:
             result = self._filtered_search(
-                f"bm25_search({quote_str(self._table_name)}, "
-                f"{quote_str(self._text_column)}, {quote_str(query_str)}, "
-                f"{self._fetch_k(query.similarity_top_k)})",
+                lambda fetch: (
+                    f"bm25_search({quote_str(self._table_name)}, "
+                    f"{quote_str(self._text_column)}, {quote_str(query_str)}, {fetch})"
+                ),
                 query.filters,
                 query.similarity_top_k,
                 ascending=False,
@@ -355,10 +381,12 @@ class InfinoVectorStore(BasePydanticVectorStore):
         k = query.hybrid_top_k or query.similarity_top_k
         if query.filters is not None:
             result = self._filtered_search(
-                f"hybrid_search({quote_str(self._table_name)}, "
-                f"{quote_str(self._text_column)}, {quote_str(query_str)}, "
-                f"{quote_str(self._vector_column)}, "
-                f"{quote_str(_vector_literal(embedding))}, {self._fetch_k(k)})",
+                lambda fetch: (
+                    f"hybrid_search({quote_str(self._table_name)}, "
+                    f"{quote_str(self._text_column)}, {quote_str(query_str)}, "
+                    f"{quote_str(self._vector_column)}, "
+                    f"{quote_str(_vector_literal(embedding))}, {fetch})"
+                ),
                 query.filters,
                 k,
                 ascending=False,
