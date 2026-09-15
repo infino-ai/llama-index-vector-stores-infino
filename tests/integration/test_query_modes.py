@@ -122,3 +122,132 @@ def test_empty_table_returns_empty_results(store):
     result = store.query(_query(query_embedding=vec(0.10)))
     assert result.nodes == []
     assert result.ids == []
+
+
+def test_text_search_applies_structured_filter(store, seeded_nodes):
+    store.add(seeded_nodes)
+    result = store.query(
+        _query(
+            query_str="billing",
+            mode=VectorStoreQueryMode.TEXT_SEARCH,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="year", value=2024)]
+            ),
+        )
+    )
+    assert {n.node_id for n in result.nodes} == {"n4"}
+
+
+def test_hybrid_applies_structured_filter(store, seeded_nodes):
+    store.add(seeded_nodes)
+    result = store.query(
+        _query(
+            query_str="billing",
+            query_embedding=vec(0.30),
+            mode=VectorStoreQueryMode.HYBRID,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value="tech")]
+            ),
+        )
+    )
+    # Exactly the tech rows: pins the filter, not just the ranking.
+    assert {n.node_id for n in result.nodes} == {"n1", "n3"}
+
+
+@pytest.mark.parametrize(
+    "mode", [VectorStoreQueryMode.TEXT_SEARCH, VectorStoreQueryMode.HYBRID]
+)
+def test_filter_query_rejected_outside_vector_search(store, seeded_nodes, mode):
+    store.add(seeded_nodes)
+    with pytest.raises(ValueError, match="filter_query"):
+        store.query(
+            _query(query_str="billing", query_embedding=vec(0.30), mode=mode),
+            filter_query="billing",
+        )
+
+
+def test_mmr_applies_structured_filter(store, seeded_nodes, embed_model):
+    store.add(seeded_nodes)
+    result = store.query(
+        _query(
+            query_embedding=vec(0.10),
+            mode=VectorStoreQueryMode.MMR,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value="tech")]
+            ),
+        ),
+        embed_model=embed_model,
+    )
+    assert {n.node_id for n in result.nodes} == {"n1", "n3"}
+
+
+def test_mmr_applies_filter_query_pushdown(store, seeded_nodes, embed_model):
+    store.add(seeded_nodes)
+    result = store.query(
+        _query(query_embedding=vec(0.10), mode=VectorStoreQueryMode.MMR),
+        embed_model=embed_model,
+        filter_query="billing",
+    )
+    assert {n.node_id for n in result.nodes} == {"n2", "n4"}
+
+
+@pytest.fixture
+def many_nodes():
+    """600 rows where `category` "rare" holds 12 — too few for a 10x pool."""
+    from tests.integration.conftest import make_node
+
+    nodes = []
+    for i in range(600):
+        category = "rare" if i % 50 == 0 else "common"
+        nodes.append(
+            make_node(
+                f"row {i} lorem ipsum",
+                id_=f"m{i}",
+                embedding=vec(i / 600),
+                metadata={"category": category, "year": 2000 + (i % 10)},
+            )
+        )
+    return nodes
+
+
+def test_selective_filter_still_fills_top_k(store, many_nodes):
+    store.add(many_nodes)
+    result = store.query(
+        _query(
+            query_embedding=vec(0.99),
+            similarity_top_k=10,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value="rare")]
+            ),
+        )
+    )
+    assert len(result.nodes) == 10
+    assert all(n.metadata["category"] == "rare" for n in result.nodes)
+
+
+def test_filter_matching_fewer_than_k_returns_all_matches(store, many_nodes):
+    store.add(many_nodes)
+    result = store.query(
+        _query(
+            query_embedding=vec(0.99),
+            similarity_top_k=20,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value="rare")]
+            ),
+        )
+    )
+    assert len(result.nodes) == 12
+
+
+def test_filter_matching_nothing_returns_empty(store, many_nodes):
+    store.add(many_nodes)
+    result = store.query(
+        _query(
+            query_embedding=vec(0.99),
+            similarity_top_k=10,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value="absent")]
+            ),
+        )
+    )
+    assert result.nodes == []

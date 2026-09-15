@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import infino
+import pyarrow as pa
 import pytest
 from llama_index.core.vector_stores.types import (
     FilterOperator,
@@ -102,3 +103,24 @@ def test_memory_connection_cannot_mutate():
     node = make_node("only in memory", id_="m1", embedding=vec(0.1))
     with pytest.raises(RuntimeError, match="no storage attached"):
         store.add([node])
+
+
+def test_reopen_with_matching_schema_succeeds(tmp_connection):
+    columns = [pa.field("category", pa.large_utf8(), nullable=True)]
+    InfinoVectorStore(tmp_connection, "reopen", dim=DIM, metadata_columns=columns)
+    store = InfinoVectorStore(tmp_connection, "reopen", dim=DIM, metadata_columns=columns)
+    assert store.count() == 0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"dim": DIM * 2}, "embedding"),
+        ({"dim": DIM, "metadata_columns": [pa.field("extra", pa.int64())]}, "extra"),
+    ],
+)
+def test_reopen_with_mismatched_schema_raises(tmp_connection, kwargs, expected):
+    InfinoVectorStore(tmp_connection, "fixed", dim=DIM)
+    with pytest.raises(ValueError, match=expected) as excinfo:
+        InfinoVectorStore(tmp_connection, "fixed", **kwargs)
+    assert "create a new table" in str(excinfo.value)
