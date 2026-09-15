@@ -262,6 +262,17 @@ class InfinoVectorStore(BasePydanticVectorStore):
 
     def _vector_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         embedding = _require_embedding(query)
+        result = self._vector_candidates(query, embedding, query.similarity_top_k, kwargs)
+        return self._to_result(result, distance_metric=True)
+
+    def _vector_candidates(
+        self,
+        query: VectorStoreQuery,
+        embedding: list[float],
+        top_k: int,
+        kwargs: dict[str, Any],
+    ) -> pa.Table:
+        """Top-k by vector distance, honouring whichever filter path is in use."""
         filter_query = kwargs.get("filter_query")
         if query.filters is not None and filter_query is not None:
             raise ValueError(
@@ -269,33 +280,31 @@ class InfinoVectorStore(BasePydanticVectorStore):
                 "`filter_query` (text pushdown, pre-rank), not both"
             )
         if filter_query is not None:
-            result = self._table.vector_search(
+            return self._table.vector_search(
                 self._vector_column,
                 embedding,
-                query.similarity_top_k,
+                top_k,
                 filter_column=kwargs.get("filter_column") or self._text_column,
                 filter_query=filter_query,
                 filter_mode=kwargs.get("filter_mode"),
                 projection=self._search_projection(),
             )
-        elif query.filters is not None:
-            result = self._filtered_search(
+        if query.filters is not None:
+            return self._filtered_search(
                 f"vector_search({quote_str(self._table_name)}, "
                 f"{quote_str(self._vector_column)}, "
                 f"{quote_str(_vector_literal(embedding))}, "
-                f"{self._fetch_k(query.similarity_top_k)})",
+                f"{self._fetch_k(top_k)})",
                 query.filters,
-                query.similarity_top_k,
+                top_k,
                 ascending=True,
             )
-        else:
-            result = self._table.vector_search(
-                self._vector_column,
-                embedding,
-                query.similarity_top_k,
-                projection=self._search_projection(),
-            )
-        return self._to_result(result, distance_metric=True)
+        return self._table.vector_search(
+            self._vector_column,
+            embedding,
+            top_k,
+            projection=self._search_projection(),
+        )
 
     def _fetch_k(self, top_k: int) -> int:
         return top_k * self._filter_oversample
@@ -379,12 +388,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
             )
         query_embedding = _require_embedding(query)
         fetch_k = int(kwargs.get("mmr_fetch_k", DEFAULT_MMR_FETCH_K))
-        candidates = self._table.vector_search(
-            self._vector_column,
-            query_embedding,
-            fetch_k,
-            projection=self._search_projection(),
-        )
+        candidates = self._vector_candidates(query, query_embedding, fetch_k, kwargs)
         base = self._to_result(candidates, distance_metric=True)
         if not base.nodes:
             return base

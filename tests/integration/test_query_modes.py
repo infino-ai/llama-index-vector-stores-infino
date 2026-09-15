@@ -164,3 +164,28 @@ def test_filter_query_rejected_outside_vector_search(store, seeded_nodes, mode):
             _query(query_str="billing", query_embedding=vec(0.30), mode=mode),
             filter_query="billing",
         )
+
+
+def test_mmr_applies_structured_filter(store, seeded_nodes, embed_model):
+    store.add(seeded_nodes)
+    result = store.query(
+        _query(
+            query_embedding=vec(0.10),
+            mode=VectorStoreQueryMode.MMR,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value="tech")]
+            ),
+        ),
+        embed_model=embed_model,
+    )
+    assert {n.node_id for n in result.nodes} == {"n1", "n3"}
+
+
+def test_mmr_applies_filter_query_pushdown(store, seeded_nodes, embed_model):
+    store.add(seeded_nodes)
+    result = store.query(
+        _query(query_embedding=vec(0.10), mode=VectorStoreQueryMode.MMR),
+        embed_model=embed_model,
+        filter_query="billing",
+    )
+    assert {n.node_id for n in result.nodes} == {"n2", "n4"}
