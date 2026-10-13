@@ -40,7 +40,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://infino.ai"
-Documentation = "https://docs.infino.ai"
+Documentation = "https://infino.ai/docs"
 Repository = "https://github.com/infino-ai/llama-index-vector-stores-infino"
 Issues = "https://github.com/infino-ai/llama-index-vector-stores-infino/issues"
 Changelog = "https://github.com/infino-ai/llama-index-vector-stores-infino/releases"
