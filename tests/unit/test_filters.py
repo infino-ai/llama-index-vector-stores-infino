@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pyarrow as pa
 import pytest
 from llama_index.core.vector_stores.types import (
     FilterCondition,
@@ -10,98 +11,105 @@ from llama_index.core.vector_stores.types import (
 
 from llama_index.vector_stores.infino._filters import compile_filters
 
-ALLOWED = {"cat", "year", "tag"}
+COLUMNS = {
+    "cat": pa.large_utf8(),
+    "year": pa.int64(),
+    "tags": pa.list_(pa.large_utf8()),
+}
 
 
-def _f(key: str, value, op: FilterOperator = FilterOperator.EQ) -> MetadataFilter:
-    return MetadataFilter(key=key, value=value, operator=op)
+def _compile(key: str, value, op: FilterOperator = FilterOperator.EQ) -> str:
+    return compile_filters(
+        MetadataFilters(filters=[MetadataFilter(key=key, value=value, operator=op)]), COLUMNS
+    )
 
 
-def _wrap(*filters, condition=FilterCondition.AND) -> MetadataFilters:
+def _group(*filters, condition=FilterCondition.AND) -> MetadataFilters:
     return MetadataFilters(filters=list(filters), condition=condition)
 
 
-def test_equality_and_comparison_operators():
-    cases = [
-        (FilterOperator.EQ, "ml", "cat = 'ml'"),
-        (FilterOperator.NE, "ml", "cat != 'ml'"),
-        (FilterOperator.GT, 2020, "cat > 2020"),
-        (FilterOperator.GTE, 2020, "cat >= 2020"),
-        (FilterOperator.LT, 2020, "cat < 2020"),
-        (FilterOperator.LTE, 2020, "cat <= 2020"),
-    ]
-    for op, value, expected in cases:
-        assert compile_filters(_wrap(_f("cat", value, op)), ALLOWED) == expected
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [
+        (FilterOperator.EQ, '"year" = 2020'),
+        (FilterOperator.NE, '"year" != 2020'),
+        (FilterOperator.GT, '"year" > 2020'),
+        (FilterOperator.GTE, '"year" >= 2020'),
+        (FilterOperator.LT, '"year" < 2020'),
+        (FilterOperator.LTE, '"year" <= 2020'),
+    ],
+)
+def test_comparisons(op, expected):
+    assert _compile("year", 2020, op) == expected
 
 
-def test_set_membership_operators():
-    in_ = compile_filters(_wrap(_f("cat", ["ml", "nlp"], FilterOperator.IN)), ALLOWED)
-    nin = compile_filters(_wrap(_f("cat", ["ml"], FilterOperator.NIN)), ALLOWED)
-    any_ = compile_filters(_wrap(_f("cat", ["ml"], FilterOperator.ANY)), ALLOWED)
-    assert in_ == "cat IN ('ml', 'nlp')"
-    assert nin == "cat NOT IN ('ml')"
-    # ANY is treated as IN for scalar columns (no list-typed columns in our schema).
-    assert any_ == "cat IN ('ml')"
+def test_in_and_not_in():
+    assert _compile("cat", ["ml", "nlp"], FilterOperator.IN) == "\"cat\" IN ('ml', 'nlp')"
+    assert _compile("cat", ["ml"], FilterOperator.NIN) == "\"cat\" NOT IN ('ml')"
 
 
-def test_all_operator_becomes_and_of_equals():
-    out = compile_filters(_wrap(_f("tag", ["a", "b"], FilterOperator.ALL)), ALLOWED)
-    assert out == "tag = 'a' AND tag = 'b'"
+def test_empty_in_matches_nothing_and_empty_nin_matches_everything():
+    assert _compile("cat", [], FilterOperator.IN) == "FALSE"
+    assert _compile("cat", [], FilterOperator.NIN) == "TRUE"
 
 
-def test_text_match_uses_escaped_like():
-    out = compile_filters(_wrap(_f("tag", "100%", FilterOperator.TEXT_MATCH)), ALLOWED)
-    # %/_ escaped, wrapped in % wildcards, ESCAPE clause emitted.
-    assert out == r"tag LIKE '%100\%%' ESCAPE '\'"
-
-
-def test_text_match_insensitive_uses_ilike():
-    out = compile_filters(
-        _wrap(_f("tag", "GPT", FilterOperator.TEXT_MATCH_INSENSITIVE)), ALLOWED
+def test_array_operators_on_list_column():
+    assert _compile("tags", "a", FilterOperator.CONTAINS) == "array_has(\"tags\", 'a')"
+    assert _compile("tags", ["a", "b"], FilterOperator.ANY) == (
+        "array_has_any(\"tags\", ['a', 'b'])"
     )
-    assert "ILIKE" in out
-    assert "'%GPT%'" in out
-
-
-def test_is_empty_handles_null_and_empty_string():
-    out = compile_filters(_wrap(_f("tag", "", FilterOperator.IS_EMPTY)), ALLOWED)
-    assert out == "(tag IS NULL OR tag = '')"
-
-
-def test_and_or_combinations():
-    and_out = compile_filters(
-        _wrap(_f("cat", "ml"), _f("year", 2024, FilterOperator.GTE)),
-        ALLOWED,
+    assert _compile("tags", ["a", "b"], FilterOperator.ALL) == (
+        "array_has_all(\"tags\", ['a', 'b'])"
     )
-    or_out = compile_filters(
-        _wrap(_f("cat", "ml"), _f("cat", "nlp"), condition=FilterCondition.OR),
-        ALLOWED,
+    assert _compile("tags", [], FilterOperator.ANY) == "FALSE"
+    assert _compile("tags", [], FilterOperator.ALL) == "TRUE"
+
+
+@pytest.mark.parametrize("op", [FilterOperator.CONTAINS, FilterOperator.ANY, FilterOperator.ALL])
+def test_array_operators_reject_scalar_columns(op):
+    with pytest.raises(ValueError, match="needs a list column"):
+        _compile("cat", ["a"], op)
+
+
+def test_scalar_operators_reject_list_columns():
+    with pytest.raises(ValueError, match="does not apply to list column"):
+        _compile("tags", "a")
+
+
+def test_is_empty_depends_on_column_type():
+    assert _compile("year", None, FilterOperator.IS_EMPTY) == '"year" IS NULL'
+    assert _compile("tags", None, FilterOperator.IS_EMPTY) == (
+        '("tags" IS NULL OR cardinality("tags") = 0)'
     )
-    assert and_out == "(cat = 'ml') AND (year >= 2024)"
-    assert or_out == "(cat = 'ml') OR (cat = 'nlp')"
 
 
-def test_nested_groups_compose():
-    inner = _wrap(_f("cat", "ml"), _f("cat", "nlp"), condition=FilterCondition.OR)
-    out = compile_filters(_wrap(inner, _f("year", 2024, FilterOperator.GTE)), ALLOWED)
-    assert out == "((cat = 'ml') OR (cat = 'nlp')) AND (year >= 2024)"
+def test_text_match_escapes_like_wildcards():
+    assert _compile("cat", "100%_x", FilterOperator.TEXT_MATCH) == (
+        r""""cat" LIKE '%100\%\_x%' ESCAPE '\'"""
+    )
+    assert _compile("cat", "GPT", FilterOperator.TEXT_MATCH_INSENSITIVE) == (
+        "\"cat\" ILIKE '%GPT%' ESCAPE '\\'"
+    )
 
 
-def test_not_condition_wraps_in_not():
-    out = compile_filters(_wrap(_f("cat", "ml"), condition=FilterCondition.NOT), ALLOWED)
-    assert out == "NOT (cat = 'ml')"
+def test_conditions_and_nesting():
+    ml = MetadataFilter(key="cat", value="ml")
+    nlp = MetadataFilter(key="cat", value="nlp")
+    recent = MetadataFilter(key="year", value=2024, operator=FilterOperator.GTE)
+    either = _group(ml, nlp, condition=FilterCondition.OR)
+    assert compile_filters(_group(either, recent), COLUMNS) == (
+        '(("cat" = \'ml\') OR ("cat" = \'nlp\')) AND ("year" >= 2024)'
+    )
+    assert compile_filters(_group(ml, condition=FilterCondition.NOT), COLUMNS) == (
+        "NOT (\"cat\" = 'ml')"
+    )
+    assert compile_filters(_group(), COLUMNS) == "TRUE"
 
 
 def test_rejects_undeclared_column():
     with pytest.raises(ValueError, match="not a declared metadata column"):
-        compile_filters(_wrap(_f("unknown", 1)), ALLOWED)
+        _compile("unknown", 1)
 
 
-def test_quotes_escape_single_quotes():
-    out = compile_filters(_wrap(_f("cat", "O'Reilly")), ALLOWED)
-    assert out == "cat = 'O''Reilly'"
-
-
-def test_empty_group_yields_true():
-    out = compile_filters(_wrap(), ALLOWED)
-    assert out == "TRUE"
+def test_escapes_single_quotes_in_values():
+    assert _compile("cat", "O'Reilly") == "\"cat\" = 'O''Reilly'"

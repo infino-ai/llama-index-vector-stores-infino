@@ -1,19 +1,19 @@
 """The :class:`InfinoVectorStore` LlamaIndex vector store.
 
 One Infino table holds each node's id, text, embedding, ``ref_doc_id``,
-declared metadata columns, and a JSON catch-all; vector, BM25, hybrid (RRF),
-and SQL retrieval all run over it.
+declared metadata columns, and the serialized node; vector, BM25, hybrid
+(RRF), and SQL retrieval all run over it.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any, ClassVar, Literal
 
 import pyarrow as pa
 from llama_index.core.bridge.pydantic import PrivateAttr
-from llama_index.core.schema import BaseNode
+from llama_index.core.schema import BaseNode, MetadataMode
 from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
     MetadataFilters,
@@ -21,56 +21,44 @@ from llama_index.core.vector_stores.types import (
     VectorStoreQueryMode,
     VectorStoreQueryResult,
 )
+from llama_index.core.vector_stores.utils import node_to_metadata_dict
 
 import infino
 from llama_index.vector_stores.infino._arrow import (
     NODE_CONTENT_COLUMN,
+    NODE_ID_COLUMN,
     NODE_TYPE_COLUMN,
+    REF_DOC_ID_COLUMN,
     SCORE_COLUMN,
-    encode_node,
+    TEXT_COLUMN,
+    VECTOR_COLUMN,
+    quote_ident,
     quote_str,
-    rows_to_results,
-    vector_array,
+    rows_to_nodes,
+    scores,
 )
 from llama_index.vector_stores.infino._filters import compile_filters
 
 Metric = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
 
-DEFAULT_METRIC: Metric = "cosine"
-DEFAULT_TEXT_COLUMN = "text"
-DEFAULT_VECTOR_COLUMN = "embedding"
-DEFAULT_NODE_ID_COLUMN = "node_id"
-DEFAULT_REF_DOC_ID_COLUMN = "ref_doc_id"
-# IVF builder clamps n_cent <= 64 below 100K rows; 64 is the effective max.
-DEFAULT_N_CENT = 64
-# MMR re-embeds candidate texts; over-fetch a wider pool than the final top-k.
 DEFAULT_MMR_FETCH_K = 20
-# Structured filters run post-rank, so over-fetch from the vector TVF and trim.
-DEFAULT_FILTER_OVERSAMPLE = 10
-# Pool growth per retry when a selective filter leaves fewer than top-k.
-FILTER_WIDEN_FACTOR = 4
 
 
 class InfinoVectorStore(BasePydanticVectorStore):
     """LlamaIndex vector store backed by a single Infino table.
 
     Args:
-        connection: a live :class:`infino.Connection` (durable; ``memory://``
-            cannot delete or upsert).
+        connection: an :class:`infino.Connection` to durable storage (a local
+            path, object storage, or Infino Cloud); ``memory://`` cannot delete,
+            so ``add`` fails on it.
         table_name: table to open; created if absent.
-        dim: embedding dimension (must be in ``[16, 4096]``).
-        metric: ``"cosine"`` (default), ``"l2sq"`` / ``"l2"``, ``"negdot"`` / ``"dot"``.
-        text_column / vector_column / node_id_column / ref_doc_id_column:
-            column names.
-        metadata_columns: metadata keys promoted to filterable scalar columns;
-            the rest round-trips via the JSON catch-all. Fixed at creation.
-        n_cent: IVF centroid count (engine-clamped on small tables).
-        filter_oversample: initial over-fetch multiplier for structured-filter
-            queries; widened automatically until the top-k is filled.
+        dim: embedding dimension, in ``[16, 4096]``.
+        metric: ``"cosine"``, ``"l2sq"`` / ``"l2"``, or ``"negdot"`` / ``"dot"``.
+        metadata_columns: metadata keys stored as filterable columns; the rest
+            round-trips in the serialized node. Fixed at table creation, and
+            named apart from the store's own columns.
     """
 
-    stores_text: bool = True
-    is_embedding_query: bool = True
     flat_metadata: ClassVar[bool] = False
 
     _connection: infino.Connection = PrivateAttr()
@@ -78,23 +66,7 @@ class InfinoVectorStore(BasePydanticVectorStore):
     _table_name: str = PrivateAttr()
     _dim: int = PrivateAttr()
     _metric: Metric = PrivateAttr()
-    _text_column: str = PrivateAttr()
-    _vector_column: str = PrivateAttr()
-    _node_id_column: str = PrivateAttr()
-    _ref_doc_id_column: str = PrivateAttr()
     _metadata_columns: list[pa.Field] = PrivateAttr()
-    _metadata_column_names: list[str] = PrivateAttr()
-    _n_cent: int = PrivateAttr()
-    _filter_oversample: int = PrivateAttr()
-
-    SUPPORTED_MODES: ClassVar[frozenset[VectorStoreQueryMode]] = frozenset(
-        {
-            VectorStoreQueryMode.DEFAULT,
-            VectorStoreQueryMode.TEXT_SEARCH,
-            VectorStoreQueryMode.HYBRID,
-            VectorStoreQueryMode.MMR,
-        }
-    )
 
     def __init__(
         self,
@@ -102,41 +74,23 @@ class InfinoVectorStore(BasePydanticVectorStore):
         table_name: str,
         *,
         dim: int,
-        metric: Metric = DEFAULT_METRIC,
-        text_column: str = DEFAULT_TEXT_COLUMN,
-        vector_column: str = DEFAULT_VECTOR_COLUMN,
-        node_id_column: str = DEFAULT_NODE_ID_COLUMN,
-        ref_doc_id_column: str = DEFAULT_REF_DOC_ID_COLUMN,
+        metric: Metric = "cosine",
         metadata_columns: Sequence[pa.Field] = (),
-        n_cent: int = DEFAULT_N_CENT,
-        filter_oversample: int = DEFAULT_FILTER_OVERSAMPLE,
     ) -> None:
-        super().__init__(stores_text=True, is_embedding_query=True)
+        super().__init__(stores_text=True)
         self._connection = connection
         self._table_name = table_name
         self._dim = dim
         self._metric = metric
-        self._text_column = text_column
-        self._vector_column = vector_column
-        self._node_id_column = node_id_column
-        self._ref_doc_id_column = ref_doc_id_column
         self._metadata_columns = list(metadata_columns)
-        self._metadata_column_names = [f.name for f in self._metadata_columns]
-        self._n_cent = n_cent
-        self._filter_oversample = filter_oversample
-        self._table = _open_or_create(connection, table_name, self._build_schema(), n_cent, metric)
-
-    @classmethod
-    def from_params(
-        cls,
-        connection: infino.Connection,
-        table_name: str,
-        *,
-        dim: int,
-        **kwargs: Any,
-    ) -> InfinoVectorStore:
-        """Construct a store, opening or creating ``table_name``."""
-        return cls(connection, table_name, dim=dim, **kwargs)
+        schema = self._build_schema()
+        names = [*schema.names, SCORE_COLUMN]
+        if len(set(names)) != len(names):
+            raise ValueError(
+                f"metadata column names must be distinct and not one of the store's "
+                f"own columns: {names}"
+            )
+        self._table = self._open_or_create(schema)
 
     @property
     def client(self) -> infino.Connection:
@@ -146,17 +100,23 @@ class InfinoVectorStore(BasePydanticVectorStore):
     def table(self) -> infino.Table:
         return self._table
 
-    def add(self, nodes: Sequence[BaseNode], **kwargs: Any) -> list[str]:
-        if not nodes:
-            return []
+    def add(self, nodes: Sequence[BaseNode], **add_kwargs: Any) -> list[str]:
+        """Upsert nodes by ``node_id``.
+
+        Deletes then appends, which is not atomic: a failed append leaves the
+        replaced nodes deleted. Raises ``ValueError`` on a repeated ``node_id``.
+        """
         ids = [n.node_id for n in nodes]
-        # Upsert = delete-by-node_id then append; not atomic (no engine txn).
-        self._delete_node_ids(ids)
-        self._append(nodes, ids)
+        if len(set(ids)) != len(ids):
+            raise ValueError("add() got the same node_id more than once")
+        if not ids:
+            return []
+        self._table.delete(_in(NODE_ID_COLUMN, ids))
+        self._append(nodes)
         return ids
 
     def delete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
-        self._table.delete(f"{self._ref_doc_id_column} = {quote_str(ref_doc_id)}")
+        self._table.delete(f"{quote_ident(REF_DOC_ID_COLUMN)} = {quote_str(ref_doc_id)}")
 
     def delete_nodes(
         self,
@@ -164,69 +124,76 @@ class InfinoVectorStore(BasePydanticVectorStore):
         filters: MetadataFilters | None = None,
         **delete_kwargs: Any,
     ) -> None:
-        predicate = self._where(node_ids=node_ids, filters=filters)
-        if predicate is not None:
-            self._table.delete(predicate)
+        where = self._where(node_ids=node_ids, filters=filters)
+        if where is not None:
+            self._table.delete(where)
 
     def get_nodes(
         self,
         node_ids: list[str] | None = None,
         filters: MetadataFilters | None = None,
     ) -> list[BaseNode]:
-        if node_ids is None and filters is None:
+        where = self._where(node_ids=node_ids, filters=filters)
+        if where is None:
             raise ValueError("get_nodes requires node_ids or filters")
-        # node_ids alone → exact_match per id (the only pre-I/O prune for uuids).
-        if node_ids is not None and filters is None:
-            return self._get_by_ids(node_ids)
-        predicate = self._where(node_ids=node_ids, filters=filters) or "TRUE"
-        columns = ", ".join(self._node_projection())
         table = self._connection.query_sql(
-            f"SELECT {columns} FROM {self._table_name} WHERE {predicate}"
+            f"SELECT {self._select_list(score=False)} "
+            f"FROM {quote_ident(self._table_name)} WHERE {where}"
         )
-        nodes, _, _ = rows_to_results(
-            table,
-            node_id_column=self._node_id_column,
-            text_column=self._text_column,
-        )
-        return nodes
+        return rows_to_nodes(table)
 
     def clear(self) -> None:
         self._connection.drop_table(self._table_name, purge=True)
-        self._table = _open_or_create(
-            self._connection,
-            self._table_name,
-            self._build_schema(),
-            self._n_cent,
-            self._metric,
-        )
+        self._table = self._open_or_create(self._build_schema())
 
     def count(self) -> int:
         """Total row count."""
-        table = self._connection.query_sql(f"SELECT COUNT(*) AS n FROM {self._table_name}")
+        table = self._connection.query_sql(
+            f"SELECT COUNT(*) AS n FROM {quote_ident(self._table_name)}"
+        )
         return int(table.column("n")[0].as_py())
 
     def optimize(self) -> None:
-        """Compact the table's superfiles."""
+        """Compact the table's files; raises on Infino Cloud, which compacts tables itself."""
         self._table.optimize()
 
     def gc(self, grace_secs: float) -> None:
-        """Reclaim storage from files older than ``grace_secs``."""
+        """Delete files no longer referenced and older than ``grace_secs``."""
         self._table.gc(grace_secs)
 
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+        """Run a query in ``DEFAULT``, ``TEXT_SEARCH``, ``HYBRID`` or ``MMR`` mode.
+
+        ``kwargs`` (``vector_store_kwargs`` on a retriever) may carry
+        ``filter_query`` / ``filter_mode`` for a full-text pre-filter on the
+        text in vector modes, and ``embed_model`` / ``mmr_fetch_k`` for MMR.
+        Raises ``NotImplementedError`` for other modes and ``ValueError`` for
+        query fields Infino does not support.
+        """
+        self._check_supported(query)
+        # VectorStoreIndex sends node_ids=[] for stores that keep their own text,
+        # so an empty list here means no constraint.
+        where = self._where(
+            node_ids=query.node_ids or None,
+            doc_ids=query.doc_ids or None,
+            filters=query.filters,
+        )
+        if kwargs.get("filter_query") is not None and where is not None:
+            raise ValueError("`filter_query` cannot be combined with filters, node_ids or doc_ids")
         mode = query.mode
         if mode == VectorStoreQueryMode.DEFAULT:
-            return self._vector_query(query, **kwargs)
+            table = self._vector_search(query, query.similarity_top_k, where, kwargs)
+            return self._result(table, distance=True)
         if mode == VectorStoreQueryMode.TEXT_SEARCH:
-            return self._text_query(query, **kwargs)
+            return self._text_query(query, where, kwargs)
         if mode == VectorStoreQueryMode.HYBRID:
-            return self._hybrid_query(query, **kwargs)
+            return self._hybrid_query(query, where, kwargs)
         if mode == VectorStoreQueryMode.MMR:
-            return self._mmr_query(query, **kwargs)
-        raise NotImplementedError(f"query mode {mode!r} is not supported")
+            return self._mmr_query(query, where, kwargs)
+        raise NotImplementedError(f"query mode {mode.value!r} is not supported")
 
-    async def async_add(self, nodes: Sequence[BaseNode], **kwargs: Any) -> list[str]:
-        return await asyncio.to_thread(self.add, nodes, **kwargs)
+    async def async_add(self, nodes: Sequence[BaseNode], **add_kwargs: Any) -> list[str]:
+        return await asyncio.to_thread(self.add, nodes, **add_kwargs)
 
     async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
         await asyncio.to_thread(self.delete, ref_doc_id, **delete_kwargs)
@@ -253,319 +220,255 @@ class InfinoVectorStore(BasePydanticVectorStore):
         return await asyncio.to_thread(self.query, query, **kwargs)
 
     def search_by_sql(self, sql: str) -> VectorStoreQueryResult:
-        """Run arbitrary SQL and map rows to a ``VectorStoreQueryResult``.
+        """Run SQL and map its rows to nodes, with ``score`` as the similarity.
 
-        The SELECT must project the store's read columns (node id, ref doc id,
-        text, declared metadata, the two ``_node_*`` catch-alls) and, for
-        ranking, ``score``.
+        The result must include ``text``, ``_node_content`` and
+        ``_node_type``; raises ``ValueError`` when one is missing.
         """
-        return self._to_result(self._connection.query_sql(sql), distance_metric=False)
+        table = self._connection.query_sql(sql)
+        required = [TEXT_COLUMN, NODE_CONTENT_COLUMN, NODE_TYPE_COLUMN]
+        missing = [c for c in required if c not in table.column_names]
+        if missing:
+            raise ValueError(f"search_by_sql result is missing columns {missing}")
+        return self._result(table, distance=False)
 
-    def _vector_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
-        embedding = _require_embedding(query)
-        result = self._vector_candidates(query, embedding, query.similarity_top_k, kwargs)
-        return self._to_result(result, distance_metric=True)
+    def _check_supported(self, query: VectorStoreQuery) -> None:
+        if query.alpha is not None:
+            raise ValueError("`alpha` is not supported: HYBRID fuses with RRF, which has no weight")
+        if query.sparse_top_k is not None:
+            raise ValueError("`sparse_top_k` is not supported: HYBRID takes one top-k")
+        if query.output_fields:
+            raise ValueError("`output_fields` is not supported: results carry whole nodes")
+        if query.embedding_field not in (None, VECTOR_COLUMN):
+            raise ValueError(f"`embedding_field` must be {VECTOR_COLUMN!r}, the store's vector")
 
-    def _vector_candidates(
+    def _vector_search(
         self,
         query: VectorStoreQuery,
-        embedding: list[float],
         top_k: int,
+        where: str | None,
         kwargs: dict[str, Any],
     ) -> pa.Table:
-        """Top-k by vector distance, honouring whichever filter path is in use."""
+        embedding = _require_embedding(query)
+        if where is not None:
+            tvf = (
+                f"vector_search({quote_str(self._table_name)}, "
+                f"{quote_str(VECTOR_COLUMN)}, {quote_str(_vector_literal(embedding))}, "
+                f"{top_k})"
+            )
+            return self._search_where(tvf, where, top_k, ascending=True)
         filter_query = kwargs.get("filter_query")
-        if query.filters is not None and filter_query is not None:
-            raise ValueError(
-                "use either `query.filters` (structured, post-rank) or "
-                "`filter_query` (text pushdown, pre-rank), not both"
-            )
-        if filter_query is not None:
+        if filter_query is None:
             return self._table.vector_search(
-                self._vector_column,
-                embedding,
-                top_k,
-                filter_column=kwargs.get("filter_column") or self._text_column,
-                filter_query=filter_query,
-                filter_mode=kwargs.get("filter_mode"),
-                projection=self._search_projection(),
-            )
-        if query.filters is not None:
-            return self._filtered_search(
-                lambda fetch: (
-                    f"vector_search({quote_str(self._table_name)}, "
-                    f"{quote_str(self._vector_column)}, "
-                    f"{quote_str(_vector_literal(embedding))}, {fetch})"
-                ),
-                query.filters,
-                top_k,
-                ascending=True,
+                VECTOR_COLUMN, embedding, top_k, projection=self._projection()
             )
         return self._table.vector_search(
-            self._vector_column,
+            VECTOR_COLUMN,
             embedding,
             top_k,
-            projection=self._search_projection(),
+            filter_column=TEXT_COLUMN,
+            filter_query=filter_query,
+            filter_mode=kwargs.get("filter_mode"),
+            projection=self._projection(),
         )
 
-    def _fetch_k(self, top_k: int) -> int:
-        return top_k * self._filter_oversample
-
-    def _filtered_search(
-        self,
-        tvf: Callable[[int], str],
-        filters: MetadataFilters,
-        top_k: int,
-        *,
-        ascending: bool,
-    ) -> pa.Table:
-        # The search TVFs take no WHERE, so over-fetch, filter, then trim. A
-        # selective filter can leave fewer than top_k, so widen the pool until
-        # it doesn't, or until the pool covers the table.
-        where = compile_filters(filters, self._metadata_column_names)
-        columns = ", ".join(self._search_projection())
-        order = "ASC" if ascending else "DESC"
-        fetch = self._fetch_k(top_k)
-        wanted = top_k
-        total: int | None = None
-        while True:
-            result = self._connection.query_sql(
-                f"SELECT {columns} FROM {tvf(fetch)} WHERE {where} "
-                f"ORDER BY {SCORE_COLUMN} {order} LIMIT {top_k}"
-            )
-            if result.num_rows >= wanted:
-                return result
-            if total is None:
-                total, matching = self._filter_counts(where)
-                wanted = min(top_k, matching)
-                if result.num_rows >= wanted:
-                    return result
-            if fetch >= total:
-                return result
-            fetch = min(fetch * FILTER_WIDEN_FACTOR, total)
-
-    def _filter_counts(self, where: str) -> tuple[int, int]:
-        """Total rows and rows matching ``where``, in one pass."""
-        table = self._connection.query_sql(
-            f"SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE {where}) AS matching "
-            f"FROM {self._table_name}"
-        )
-        return int(table.column("total")[0].as_py()), int(table.column("matching")[0].as_py())
-
-    def _text_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+    def _text_query(
+        self, query: VectorStoreQuery, where: str | None, kwargs: dict[str, Any]
+    ) -> VectorStoreQueryResult:
         query_str = _require_query_str(query, "TEXT_SEARCH")
-        _reject_pushdown(kwargs, "TEXT_SEARCH")
-        if query.filters is not None:
-            result = self._filtered_search(
-                lambda fetch: (
-                    f"bm25_search({quote_str(self._table_name)}, "
-                    f"{quote_str(self._text_column)}, {quote_str(query_str)}, {fetch})"
-                ),
-                query.filters,
-                query.similarity_top_k,
-                ascending=False,
+        _reject_filter_query(kwargs, "TEXT_SEARCH")
+        top_k = query.similarity_top_k
+        if where is None:
+            table = self._table.bm25_search(
+                TEXT_COLUMN, query_str, top_k, projection=self._projection()
             )
         else:
-            result = self._table.bm25_search(
-                self._text_column,
-                query_str,
-                query.similarity_top_k,
-                projection=self._search_projection(),
+            tvf = (
+                f"bm25_search({quote_str(self._table_name)}, "
+                f"{quote_str(TEXT_COLUMN)}, {quote_str(query_str)}, {top_k})"
             )
-        return self._to_result(result, distance_metric=False)
+            table = self._search_where(tvf, where, top_k, ascending=False)
+        return self._result(table, distance=False)
 
-    def _hybrid_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+    def _hybrid_query(
+        self, query: VectorStoreQuery, where: str | None, kwargs: dict[str, Any]
+    ) -> VectorStoreQueryResult:
         query_str = _require_query_str(query, "HYBRID")
         embedding = _require_embedding(query)
-        _reject_pushdown(kwargs, "HYBRID")
-        k = query.hybrid_top_k or query.similarity_top_k
-        if query.filters is not None:
-            result = self._filtered_search(
-                lambda fetch: (
-                    f"hybrid_search({quote_str(self._table_name)}, "
-                    f"{quote_str(self._text_column)}, {quote_str(query_str)}, "
-                    f"{quote_str(self._vector_column)}, "
-                    f"{quote_str(_vector_literal(embedding))}, {fetch})"
-                ),
-                query.filters,
-                k,
-                ascending=False,
+        _reject_filter_query(kwargs, "HYBRID")
+        top_k = query.hybrid_top_k or query.similarity_top_k
+        if where is None:
+            table = self._table.hybrid_search(
+                TEXT_COLUMN,
+                query_str,
+                VECTOR_COLUMN,
+                embedding,
+                top_k,
+                projection=self._projection(),
             )
         else:
-            result = self._table.hybrid_search(
-                self._text_column,
-                query_str,
-                self._vector_column,
-                embedding,
-                k,
-                projection=self._search_projection(),
+            tvf = (
+                f"hybrid_search({quote_str(self._table_name)}, "
+                f"{quote_str(TEXT_COLUMN)}, {quote_str(query_str)}, "
+                f"{quote_str(VECTOR_COLUMN)}, {quote_str(_vector_literal(embedding))}, "
+                f"{top_k})"
             )
-        return self._to_result(result, distance_metric=False)
+            table = self._search_where(tvf, where, top_k, ascending=False)
+        return self._result(table, distance=False)
 
-    def _mmr_query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
-        # Local import: keep MMR utils off the import path for non-MMR users.
-        from llama_index.core.indices.query.embedding_utils import (
-            get_top_k_mmr_embeddings,
-        )
+    def _mmr_query(
+        self, query: VectorStoreQuery, where: str | None, kwargs: dict[str, Any]
+    ) -> VectorStoreQueryResult:
+        from llama_index.core.indices.query.embedding_utils import get_top_k_mmr_embeddings
 
         embed_model = kwargs.get("embed_model")
         if embed_model is None:
             raise ValueError(
-                "MMR requires `embed_model` in vector_store_kwargs: Infino "
-                "does not return stored vectors, so candidate texts are re-embedded"
+                "MMR requires `embed_model` in vector_store_kwargs: Infino does not "
+                "return stored vectors, so candidates are re-embedded"
             )
-        query_embedding = _require_embedding(query)
         fetch_k = int(kwargs.get("mmr_fetch_k", DEFAULT_MMR_FETCH_K))
-        candidates = self._vector_candidates(query, query_embedding, fetch_k, kwargs)
-        base = self._to_result(candidates, distance_metric=True)
-        if not base.nodes:
-            return base
-        candidate_embeddings = embed_model.get_text_embedding_batch(
-            [n.get_content() for n in base.nodes]
+        candidates = self._result(self._vector_search(query, fetch_k, where, kwargs), distance=True)
+        if not candidates.nodes:
+            return candidates
+        embeddings = embed_model.get_text_embedding_batch(
+            [n.get_content(metadata_mode=MetadataMode.EMBED) for n in candidates.nodes]
         )
-        _scores, selected_idx = get_top_k_mmr_embeddings(
-            query_embedding=query_embedding,
-            embeddings=candidate_embeddings,
+        _, selected = get_top_k_mmr_embeddings(
+            query_embedding=_require_embedding(query),
+            embeddings=embeddings,
             similarity_top_k=query.similarity_top_k,
-            embedding_ids=list(range(len(base.nodes))),
+            embedding_ids=list(range(len(candidates.nodes))),
             mmr_threshold=query.mmr_threshold,
         )
-        nodes = [base.nodes[i] for i in selected_idx]
-        ids_list = base.ids or []
-        ids = [ids_list[i] for i in selected_idx] if ids_list else []
-        sims = (
-            [base.similarities[i] for i in selected_idx] if base.similarities is not None else None
+        similarities = candidates.similarities or []
+        return VectorStoreQueryResult(
+            nodes=[candidates.nodes[i] for i in selected],
+            ids=[candidates.nodes[i].node_id for i in selected],
+            similarities=[similarities[i] for i in selected],
         )
-        return VectorStoreQueryResult(nodes=nodes, ids=ids, similarities=sims)
 
-    def _get_by_ids(self, node_ids: Sequence[str]) -> list[BaseNode]:
-        # exact_match on the unique node_id returns <=1 row, so dedup the input
-        # (preserving order) rather than the results.
-        projection = self._node_projection()
-        nodes: list[BaseNode] = []
-        for node_id in dict.fromkeys(node_ids):
-            table = self._table.exact_match(self._node_id_column, node_id, projection=projection)
-            found, _, _ = rows_to_results(
-                table,
-                node_id_column=self._node_id_column,
-                text_column=self._text_column,
-            )
-            nodes.extend(found)
-        return nodes
+    def _search_where(self, tvf: str, where: str, top_k: int, *, ascending: bool) -> pa.Table:
+        # A WHERE over a search function ranks within exactly the rows it keeps.
+        order = "ASC" if ascending else "DESC"
+        return self._connection.query_sql(
+            f"SELECT {self._select_list(score=True)} FROM {tvf} WHERE {where} "
+            f"ORDER BY {SCORE_COLUMN} {order} LIMIT {top_k}"
+        )
 
-    def _search_projection(self) -> list[str]:
-        return [*self._node_projection(), SCORE_COLUMN]
-
-    def _node_projection(self) -> list[str]:
+    def _projection(self) -> list[str]:
         return [
-            self._node_id_column,
-            self._ref_doc_id_column,
-            self._text_column,
-            *self._metadata_column_names,
+            TEXT_COLUMN,
+            *(f.name for f in self._metadata_columns),
             NODE_CONTENT_COLUMN,
             NODE_TYPE_COLUMN,
+            SCORE_COLUMN,
         ]
+
+    def _select_list(self, *, score: bool) -> str:
+        columns = self._projection() if score else self._projection()[:-1]
+        return ", ".join(quote_ident(c) for c in columns)
 
     def _where(
         self,
         *,
-        node_ids: Sequence[str] | None,
-        filters: MetadataFilters | None,
+        node_ids: Sequence[str] | None = None,
+        doc_ids: Sequence[str] | None = None,
+        filters: MetadataFilters | None = None,
     ) -> str | None:
-        parts: list[str] = []
-        if node_ids:
-            id_list = ", ".join(quote_str(i) for i in node_ids)
-            parts.append(f"{self._node_id_column} IN ({id_list})")
+        parts = []
+        if node_ids is not None:
+            parts.append(_in(NODE_ID_COLUMN, node_ids))
+        if doc_ids is not None:
+            parts.append(_in(REF_DOC_ID_COLUMN, doc_ids))
         if filters is not None:
-            parts.append(compile_filters(filters, self._metadata_column_names))
-        if not parts:
-            return None
-        return " AND ".join(parts) if len(parts) > 1 else parts[0]
+            columns = {f.name: f.type for f in self._metadata_columns}
+            parts.append(compile_filters(filters, columns))
+        return " AND ".join(f"({p})" for p in parts) if parts else None
 
-    def _append(self, nodes: Sequence[BaseNode], ids: Sequence[str]) -> None:
-        rows = [encode_node(n, self._metadata_column_names) for n in nodes]
-        arrays: list[pa.Array] = [
-            pa.array(ids, type=pa.large_utf8()),
-            pa.array([r["ref_doc_id"] for r in rows], type=pa.large_utf8()),
-            pa.array([r["text"] for r in rows], type=pa.large_utf8()),
-            vector_array([r["embedding"] for r in rows], self._dim),
-        ]
-        for field in self._metadata_columns:
-            arrays.append(pa.array([r.get(field.name) for r in rows], type=field.type))
-        arrays.append(pa.array([r[NODE_CONTENT_COLUMN] for r in rows], type=pa.large_utf8()))
-        arrays.append(pa.array([r[NODE_TYPE_COLUMN] for r in rows], type=pa.large_utf8()))
-        batch = pa.record_batch(arrays, schema=self._table.schema())
-        self._table.append(batch)
+    def _append(self, nodes: Sequence[BaseNode]) -> None:
+        serialized = [node_to_metadata_dict(n, remove_text=True) for n in nodes]
+        columns: dict[str, list[Any]] = {
+            NODE_ID_COLUMN: [n.node_id for n in nodes],
+            REF_DOC_ID_COLUMN: [n.ref_doc_id or "" for n in nodes],
+            TEXT_COLUMN: [n.get_content(metadata_mode=MetadataMode.NONE) for n in nodes],
+            VECTOR_COLUMN: [n.get_embedding() for n in nodes],
+            **{f.name: [n.metadata.get(f.name) for n in nodes] for f in self._metadata_columns},
+            NODE_CONTENT_COLUMN: [s[NODE_CONTENT_COLUMN] for s in serialized],
+            NODE_TYPE_COLUMN: [s[NODE_TYPE_COLUMN] for s in serialized],
+        }
+        self._table.append(pa.Table.from_pydict(columns, schema=self._table.schema()))
 
-    def _delete_node_ids(self, ids: Sequence[str]) -> None:
-        if not ids:
-            return
-        id_list = ", ".join(quote_str(i) for i in ids)
-        self._table.delete(f"{self._node_id_column} IN ({id_list})")
-
-    def _to_result(self, table: pa.Table, *, distance_metric: bool) -> VectorStoreQueryResult:
-        nodes, ids, scores = rows_to_results(
-            table,
-            node_id_column=self._node_id_column,
-            text_column=self._text_column,
-        )
+    def _result(self, table: pa.Table, *, distance: bool) -> VectorStoreQueryResult:
+        nodes = rows_to_nodes(table)
+        raw = scores(table)
         similarities = (
-            [_distance_to_similarity(self._metric, s) for s in scores]
-            if distance_metric and scores is not None
-            else scores
+            [_distance_to_similarity(self._metric, d) for d in raw]
+            if distance and raw is not None
+            else raw
         )
-        return VectorStoreQueryResult(nodes=nodes, ids=ids, similarities=similarities)
+        return VectorStoreQueryResult(
+            nodes=nodes, ids=[n.node_id for n in nodes], similarities=similarities
+        )
 
     def _build_schema(self) -> pa.Schema:
         return pa.schema(
             [
-                pa.field(self._node_id_column, pa.large_utf8(), nullable=False),
-                pa.field(self._ref_doc_id_column, pa.large_utf8(), nullable=False),
-                pa.field(self._text_column, pa.large_utf8(), nullable=False),
-                pa.field(
-                    self._vector_column,
-                    pa.list_(pa.float32(), self._dim),
-                    nullable=False,
-                ),
+                pa.field(NODE_ID_COLUMN, pa.large_utf8(), nullable=False),
+                pa.field(REF_DOC_ID_COLUMN, pa.large_utf8(), nullable=False),
+                pa.field(TEXT_COLUMN, pa.large_utf8(), nullable=False),
+                pa.field(VECTOR_COLUMN, pa.list_(pa.float32(), self._dim), nullable=False),
                 *self._metadata_columns,
                 pa.field(NODE_CONTENT_COLUMN, pa.large_utf8(), nullable=False),
                 pa.field(NODE_TYPE_COLUMN, pa.large_utf8(), nullable=False),
             ]
         )
 
+    def _open_or_create(self, schema: pa.Schema) -> infino.Table:
+        if self._table_name in self._connection.list_tables():
+            table = self._connection.open_table(self._table_name)
+            stored = table.schema()
+            if not stored.equals(schema):
+                raise ValueError(
+                    f"table {self._table_name!r} exists with a different schema; `dim` and "
+                    f"`metadata_columns` are fixed at creation: "
+                    + "; ".join(_schema_mismatch(stored, schema))
+                    + ". Open it with the stored schema, or create a new table for the new shape."
+                )
+            return table
+        indexes = (
+            infino.IndexSpec()
+            .fts(NODE_ID_COLUMN)
+            .fts(REF_DOC_ID_COLUMN)
+            .fts(TEXT_COLUMN)
+            .vector(VECTOR_COLUMN, self._dim, self._metric)
+        )
+        return self._connection.create_table(self._table_name, schema, indexes)
 
-def _open_or_create(
-    connection: infino.Connection,
-    table_name: str,
-    schema: pa.Schema,
-    n_cent: int,
-    metric: Metric,
-) -> infino.Table:
-    if table_name in connection.list_tables():
-        table = connection.open_table(table_name)
-        stored = table.schema()
-        if not stored.equals(schema):
-            raise ValueError(
-                f"table {table_name!r} exists with a different schema — `dim` and "
-                f"`metadata_columns` are fixed at creation: "
-                + "; ".join(_schema_mismatch(stored, schema))
-                + ". Open it with the stored schema, or create a new table for the new shape."
-            )
-        return table
-    indexes = (
-        infino.IndexSpec()
-        .fts(schema.field(0).name)  # node_id
-        .fts(schema.field(1).name)  # ref_doc_id
-        .fts(schema.field(2).name)  # text
-        .vector(schema.field(3).name, schema.field(3).type.list_size, metric)
-    )
-    return connection.create_table(table_name, schema, indexes)
+
+def _in(column: str, values: Sequence[str]) -> str:
+    if not values:
+        return "FALSE"
+    return f"{quote_ident(column)} IN ({', '.join(quote_str(v) for v in values)})"
 
 
 def _require_embedding(query: VectorStoreQuery) -> list[float]:
     if query.query_embedding is None:
-        raise ValueError("query.query_embedding is required for this mode")
+        raise ValueError(f"query.query_embedding is required for {query.mode.value} mode")
     return list(query.query_embedding)
+
+
+def _require_query_str(query: VectorStoreQuery, mode: str) -> str:
+    if not query.query_str:
+        raise ValueError(f"query.query_str is required for {mode}")
+    return query.query_str
+
+
+def _reject_filter_query(kwargs: dict[str, Any], mode: str) -> None:
+    if kwargs.get("filter_query") is not None:
+        raise ValueError(
+            f"`filter_query` applies to vector search only, not {mode}; use `query.filters`"
+        )
 
 
 def _schema_mismatch(stored: pa.Schema, declared: pa.Schema) -> list[str]:
@@ -580,28 +483,13 @@ def _schema_mismatch(stored: pa.Schema, declared: pa.Schema) -> list[str]:
 
 
 def _vector_literal(embedding: Sequence[float]) -> str:
-    return ",".join(str(float(x)) for x in embedding)
-
-
-def _reject_pushdown(kwargs: dict[str, Any], mode: str) -> None:
-    if kwargs.get("filter_query") is not None:
-        raise ValueError(
-            f"`filter_query` is a vector-search pushdown and does not apply to "
-            f"{mode}; use `query.filters` instead"
-        )
-
-
-def _require_query_str(query: VectorStoreQuery, mode: str) -> str:
-    if not query.query_str:
-        raise ValueError(f"query.query_str is required for {mode}")
-    return query.query_str
+    return ",".join(repr(float(x)) for x in embedding)
 
 
 def _distance_to_similarity(metric: Metric, distance: float) -> float:
-    """Map a raw distance into a [0, 1] relevance where higher is better."""
+    """Turn an engine distance into a similarity where higher is better."""
     if metric == "cosine":
-        return max(0.0, min(1.0, 1.0 - distance))
+        return 1.0 - distance
     if metric in ("l2", "l2sq"):
         return 1.0 / (1.0 + distance)
-    # negdot/dot: smaller distance means more similar; negate so larger = better.
     return -distance
