@@ -61,13 +61,6 @@ include = ["llama_index/"]
 [tool.hatch.build.targets.wheel]
 include = ["llama_index/"]
 
-[tool.llamahub]
-contains_example = false
-import_path = "llama_index.vector_stores.infino"
-
-[tool.llamahub.class_authors]
-InfinoVectorStore = "infino-ai"
-
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
