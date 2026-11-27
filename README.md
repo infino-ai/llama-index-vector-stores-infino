@@ -28,8 +28,8 @@ integration uses the embeddings already attached to your nodes.
 pip install llama-index-vector-stores-infino
 ```
 
-Requires Python 3.10+. `infino`, `llama-index-core`, `pyarrow`, and `numpy`
-are installed as dependencies. Bring your own embeddings provider separately
+Requires Python 3.10+. `infino`, `llama-index-core`, and `pyarrow` are
+installed as dependencies. Bring your own embeddings provider separately
 (e.g. `pip install llama-index-embeddings-openai`).
 
 ## Quickstart
@@ -85,18 +85,19 @@ store = InfinoVectorStore(connection, table_name="docs", dim=384)
   and opened on subsequent runs.
 - **Identity** — `node.node_id` is the durable id; `ref_doc_id` lets
   `delete(ref_doc_id)` drop all chunks of a source document in one call.
-  Both are FTS-indexed so the engine prunes superfiles before I/O.
+  Both are full-text indexed, so lookups and deletes by id skip files that
+  cannot hold the id.
 - **Metadata, two tiers** — keys you name in `metadata_columns=` become real
-  scalar columns you can filter on; everything else round-trips losslessly
-  through a JSON catch-all but isn't filterable. The schema is fixed at
-  table creation — adding a new filterable key means recreating the table.
-- **Storage** — `add`, `delete`, and `clear` need durable storage (a local
-  path or S3 URI). A `memory://` connection cannot delete or upsert and will
-  raise; use it only for read-only experiments. `dim` must be in `[16, 4096]`.
-- **Scores** — vector distance is *smaller is nearer*; BM25 and RRF are
-  *larger is better*. `VectorStoreQueryResult.similarities` always
-  represents "higher = better" — distances are normalized for `cosine`,
-  `l2`, and `l2sq`.
+  columns (scalar or list) you can filter on; everything else round-trips
+  losslessly in the serialized node but isn't filterable. The schema is fixed
+  at table creation — adding a new filterable key means recreating the table.
+- **Storage** — the store needs durable storage: a local path, object
+  storage, or Infino Cloud. A `memory://` connection cannot delete, so `add`
+  (an upsert) raises on it. `dim` must be in `[16, 4096]`.
+- **Scores** — `VectorStoreQueryResult.similarities` is always "higher is
+  better": cosine similarity (`1 - distance`, in `[-1, 1]`) for `cosine`,
+  `1 / (1 + distance)` for `l2` / `l2sq`, the dot product for `dot` /
+  `negdot`, and the raw BM25 or RRF score for `TEXT_SEARCH` and `HYBRID`.
 
 ## Query modes
 
@@ -121,10 +122,17 @@ be passed via `vector_store_kwargs`.
 ## Metadata filtering
 
 Promote the keys you want to filter on to real columns, then pass a
-`MetadataFilters`. The full LlamaIndex operator surface is supported:
-`EQ` / `NE` / `GT` / `GTE` / `LT` / `LTE`, `IN` / `NIN`, `ANY` / `ALL`,
-`CONTAINS`, `TEXT_MATCH` / `TEXT_MATCH_INSENSITIVE`, `IS_EMPTY`, plus
-nested `AND` / `OR` / `NOT`.
+`MetadataFilters`. Every LlamaIndex operator is supported, with its LlamaIndex
+meaning:
+
+- scalar columns: `EQ` / `NE` / `GT` / `GTE` / `LT` / `LTE`, `IN` / `NIN`,
+  `TEXT_MATCH` (substring, `LIKE`) / `TEXT_MATCH_INSENSITIVE` (`ILIKE`);
+- list columns (e.g. `pa.list_(pa.large_utf8())`): `CONTAINS` (holds the
+  value), `ANY` (holds any of the values), `ALL` (holds all of them);
+- any column: `IS_EMPTY` (null, or an empty list);
+- nested `AND` / `OR` / `NOT` groups.
+
+An operator used on the wrong kind of column raises `ValueError`.
 
 ```python
 import pyarrow as pa
@@ -149,11 +157,14 @@ retriever = index.as_retriever(
 )
 ```
 
+Filters run inside the search in every mode: the result is the top-k among
+matching rows, however deep they rank, or every match when fewer than k exist.
+A query's `doc_ids` and `node_ids` restrict the search the same way.
+
 ## Text-pushdown pre-filter
 
-For a *text* predicate, push it into the kNN instead of post-filtering the
-top-k. The engine prunes to rows matching the full-text terms **before**
-ranking, so no over-fetch is needed.
+For a *text* predicate, the engine can prune to rows matching full-text terms
+before the vector search ranks them.
 Pass it via `vector_store_kwargs`:
 
 ```python
@@ -163,13 +174,34 @@ retriever = index.as_retriever(
 )
 ```
 
-`filters` (structured, post-rank `WHERE`) and `filter_query` (text,
-pre-rank pushdown) are distinct paths and not combinable in one call.
+`filter_query` cannot be combined with `filters`, `doc_ids` or `node_ids`
+in one call, and applies to vector search (`DEFAULT` and `MMR`) only.
+
+## Not supported
+
+These raise rather than being silently ignored:
+
+- `VectorStoreQueryMode`s other than `DEFAULT`, `TEXT_SEARCH`, `HYBRID` and
+  `MMR` (`NotImplementedError`).
+- `alpha`: `HYBRID` fuses with reciprocal-rank fusion, which has no weight.
+- `sparse_top_k`: `HYBRID` takes a single top-k (`hybrid_top_k`, else
+  `similarity_top_k`).
+- `output_fields`: results always carry whole nodes.
+- `embedding_field` other than the store's vector column.
+
+Two engine limits shape behaviour:
+
+- Stored vectors cannot be read back, so `MMR` re-embeds its candidates and
+  needs an `embed_model`.
+- `add` replaces existing nodes by deleting then appending, which is not
+  atomic: a failed append leaves the replaced nodes deleted.
 
 ## SQL escape hatch
 
 The escape hatch for what the typed modes don't cover — joins, custom
-`WHERE`, or the raw `vector_search` / `hybrid_search` table functions:
+`WHERE`, or the raw `vector_search` / `hybrid_search` table functions. The
+result must include `text`, `_node_content` and `_node_type`; `score`, when
+present, becomes the similarity as is:
 
 ```python
 qv = ",".join(str(x) for x in embed_model.get_query_embedding("fox"))
@@ -189,21 +221,20 @@ synchronous engine, so the event loop is never blocked.
 ## API reference
 
 - `InfinoVectorStore(connection, table_name, *, dim, metric="cosine",
-  text_column="text", vector_column="embedding", node_id_column="node_id",
-  ref_doc_id_column="ref_doc_id", metadata_columns=(), n_cent=64,
-  filter_oversample=10)` — also available as
-  `InfinoVectorStore.from_params(connection, table_name, *, dim, **kwargs)`.
+  metadata_columns=())`. The table's own columns are `node_id`, `ref_doc_id`,
+  `text`, `embedding`, `_node_content` and `_node_type`; metadata columns take
+  other names, and not `score`.
 - `add(nodes) -> list[str]` — upsert by `node_id` (delete-then-append; not
-  atomic).
+  atomic). A repeated `node_id` in one call raises.
 - `delete(ref_doc_id)` — drop all chunks of a source document.
 - `delete_nodes(node_ids=None, filters=None)` — combined predicate delete.
-- `get_nodes(node_ids=None, filters=None) -> list[BaseNode]` — `node_ids`
-  alone prune via `exact_match`.
+- `get_nodes(node_ids=None, filters=None) -> list[BaseNode]` — both given
+  means both must match; an empty `node_ids` matches nothing.
 - `clear()` — drop and recreate the table.
 - `count() -> int` — total row count.
 - `optimize()` / `gc(grace_secs)` — compact superfiles / reclaim storage.
-- `query(VectorStoreQuery, *, filter_query=None, filter_column=None,
-  filter_mode=None, embed_model=None) -> VectorStoreQueryResult`
+- `query(VectorStoreQuery, *, filter_query=None, filter_mode=None,
+  embed_model=None, mmr_fetch_k=20) -> VectorStoreQueryResult`
 - `search_by_sql(sql) -> VectorStoreQueryResult`
 - Async siblings: `async_add`, `aquery`, `adelete`, `adelete_nodes`,
   `aget_nodes`, `aclear`.

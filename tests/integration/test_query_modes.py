@@ -26,9 +26,7 @@ def test_default_mode_returns_vector_neighbours(store, seeded_nodes):
 
 def test_text_search_mode_runs_bm25(store, seeded_nodes):
     store.add(seeded_nodes)
-    result = store.query(
-        _query(query_str="billing", mode=VectorStoreQueryMode.TEXT_SEARCH)
-    )
+    result = store.query(_query(query_str="billing", mode=VectorStoreQueryMode.TEXT_SEARCH))
     assert {n.node_id for n in result.nodes} == {"n2", "n4"}
 
 
@@ -79,9 +77,7 @@ def test_structured_filter_post_rank(store, seeded_nodes):
     result = store.query(
         _query(
             query_embedding=vec(0.10),
-            filters=MetadataFilters(
-                filters=[MetadataFilter(key="category", value="support")]
-            ),
+            filters=MetadataFilters(filters=[MetadataFilter(key="category", value="support")]),
         )
     )
     assert {n.node_id for n in result.nodes} <= {"n2", "n4"}
@@ -89,13 +85,11 @@ def test_structured_filter_post_rank(store, seeded_nodes):
 
 def test_structured_and_pushdown_are_mutually_exclusive(store, seeded_nodes):
     store.add(seeded_nodes)
-    with pytest.raises(ValueError, match="not both"):
+    with pytest.raises(ValueError, match="cannot be combined"):
         store.query(
             _query(
                 query_embedding=vec(0.10),
-                filters=MetadataFilters(
-                    filters=[MetadataFilter(key="category", value="tech")]
-                ),
+                filters=MetadataFilters(filters=[MetadataFilter(key="category", value="tech")]),
             ),
             filter_query="billing",
         )
@@ -104,18 +98,14 @@ def test_structured_and_pushdown_are_mutually_exclusive(store, seeded_nodes):
 def test_search_by_sql_returns_nodes(store, seeded_nodes):
     store.add(seeded_nodes)
     columns = "node_id, ref_doc_id, text, category, year, _node_content, _node_type"
-    result = store.search_by_sql(
-        f"SELECT {columns} FROM docs WHERE category = 'tech'"
-    )
+    result = store.search_by_sql(f"SELECT {columns} FROM docs WHERE category = 'tech'")
     assert {n.node_id for n in result.nodes} == {"n1", "n3"}
 
 
 def test_unsupported_mode_raises(store, seeded_nodes):
     store.add(seeded_nodes)
     with pytest.raises(NotImplementedError):
-        store.query(
-            _query(query_embedding=vec(0.10), mode=VectorStoreQueryMode.SPARSE)
-        )
+        store.query(_query(query_embedding=vec(0.10), mode=VectorStoreQueryMode.SPARSE))
 
 
 def test_empty_table_returns_empty_results(store):
@@ -130,9 +120,7 @@ def test_text_search_applies_structured_filter(store, seeded_nodes):
         _query(
             query_str="billing",
             mode=VectorStoreQueryMode.TEXT_SEARCH,
-            filters=MetadataFilters(
-                filters=[MetadataFilter(key="year", value=2024)]
-            ),
+            filters=MetadataFilters(filters=[MetadataFilter(key="year", value=2024)]),
         )
     )
     assert {n.node_id for n in result.nodes} == {"n4"}
@@ -145,18 +133,14 @@ def test_hybrid_applies_structured_filter(store, seeded_nodes):
             query_str="billing",
             query_embedding=vec(0.30),
             mode=VectorStoreQueryMode.HYBRID,
-            filters=MetadataFilters(
-                filters=[MetadataFilter(key="category", value="tech")]
-            ),
+            filters=MetadataFilters(filters=[MetadataFilter(key="category", value="tech")]),
         )
     )
     # Exactly the tech rows: pins the filter, not just the ranking.
     assert {n.node_id for n in result.nodes} == {"n1", "n3"}
 
 
-@pytest.mark.parametrize(
-    "mode", [VectorStoreQueryMode.TEXT_SEARCH, VectorStoreQueryMode.HYBRID]
-)
+@pytest.mark.parametrize("mode", [VectorStoreQueryMode.TEXT_SEARCH, VectorStoreQueryMode.HYBRID])
 def test_filter_query_rejected_outside_vector_search(store, seeded_nodes, mode):
     store.add(seeded_nodes)
     with pytest.raises(ValueError, match="filter_query"):
@@ -172,9 +156,7 @@ def test_mmr_applies_structured_filter(store, seeded_nodes, embed_model):
         _query(
             query_embedding=vec(0.10),
             mode=VectorStoreQueryMode.MMR,
-            filters=MetadataFilters(
-                filters=[MetadataFilter(key="category", value="tech")]
-            ),
+            filters=MetadataFilters(filters=[MetadataFilter(key="category", value="tech")]),
         ),
         embed_model=embed_model,
     )
@@ -210,44 +192,66 @@ def many_nodes():
     return nodes
 
 
-def test_selective_filter_still_fills_top_k(store, many_nodes):
-    store.add(many_nodes)
-    result = store.query(
-        _query(
-            query_embedding=vec(0.99),
-            similarity_top_k=10,
-            filters=MetadataFilters(
-                filters=[MetadataFilter(key="category", value="rare")]
-            ),
-        )
+RANKED_MODES = [
+    VectorStoreQueryMode.DEFAULT,
+    VectorStoreQueryMode.TEXT_SEARCH,
+    VectorStoreQueryMode.HYBRID,
+]
+
+
+def _filtered(mode, category, top_k):
+    return _query(
+        query_str="lorem",
+        query_embedding=vec(0.99),
+        mode=mode,
+        similarity_top_k=top_k,
+        filters=MetadataFilters(filters=[MetadataFilter(key="category", value=category)]),
     )
+
+
+@pytest.mark.parametrize("mode", RANKED_MODES)
+def test_selective_filter_still_fills_top_k(store, many_nodes, mode):
+    store.add(many_nodes)
+    result = store.query(_filtered(mode, "rare", 10))
     assert len(result.nodes) == 10
     assert all(n.metadata["category"] == "rare" for n in result.nodes)
 
 
-def test_filter_matching_fewer_than_k_returns_all_matches(store, many_nodes):
+@pytest.mark.parametrize("mode", RANKED_MODES)
+def test_filter_matching_fewer_than_k_returns_all_matches(store, many_nodes, mode):
     store.add(many_nodes)
-    result = store.query(
-        _query(
-            query_embedding=vec(0.99),
-            similarity_top_k=20,
-            filters=MetadataFilters(
-                filters=[MetadataFilter(key="category", value="rare")]
-            ),
-        )
-    )
-    assert len(result.nodes) == 12
+    assert len(store.query(_filtered(mode, "rare", 20)).nodes) == 12
 
 
-def test_filter_matching_nothing_returns_empty(store, many_nodes):
+@pytest.mark.parametrize("mode", RANKED_MODES)
+def test_filter_matching_nothing_returns_empty(store, many_nodes, mode):
     store.add(many_nodes)
-    result = store.query(
-        _query(
-            query_embedding=vec(0.99),
-            similarity_top_k=10,
-            filters=MetadataFilters(
-                filters=[MetadataFilter(key="category", value="absent")]
-            ),
-        )
-    )
-    assert result.nodes == []
+    assert store.query(_filtered(mode, "absent", 10)).nodes == []
+
+
+@pytest.mark.parametrize("mode", RANKED_MODES)
+def test_doc_ids_and_node_ids_constrain_the_search(store, seeded_nodes, mode):
+    store.add(seeded_nodes)
+    by_doc = _query(query_str="billing", query_embedding=vec(0.1), mode=mode, doc_ids=["doc-b"])
+    by_node = _query(query_str="billing", query_embedding=vec(0.1), mode=mode, node_ids=["n2"])
+    assert {n.node_id for n in store.query(by_doc).nodes} == {"n2", "n4"}
+    assert [n.node_id for n in store.query(by_node).nodes] == ["n2"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("alpha", 0.5),
+        ("sparse_top_k", 5),
+        ("output_fields", ["text"]),
+        ("embedding_field", "other"),
+    ],
+)
+def test_unsupported_query_fields_raise(store, field, value):
+    with pytest.raises(ValueError, match=field):
+        store.query(_query(query_embedding=vec(0.1), **{field: value}))
+
+
+def test_empty_node_ids_in_a_query_are_unconstrained(store, seeded_nodes):
+    store.add(seeded_nodes)
+    assert len(store.query(_query(query_embedding=vec(0.1), node_ids=[])).nodes) == 3

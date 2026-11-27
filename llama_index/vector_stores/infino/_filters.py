@@ -1,13 +1,14 @@
-"""Compile LlamaIndex ``MetadataFilters`` to a SQL ``WHERE`` clause body.
+"""Compile LlamaIndex ``MetadataFilters`` to a SQL predicate.
 
-Filters apply only to declared metadata columns — the engine cannot index
-into the serialized ``_node_content`` JSON catch-all.
+Filters apply only to declared metadata columns; keys that live only in the
+serialized node content cannot be filtered on.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Mapping
 
+import pyarrow as pa
 from llama_index.core.vector_stores.types import (
     FilterCondition,
     FilterOperator,
@@ -15,9 +16,9 @@ from llama_index.core.vector_stores.types import (
     MetadataFilters,
 )
 
-from llama_index.vector_stores.infino._arrow import quote_str, sql_value
+from llama_index.vector_stores.infino._arrow import quote_ident, quote_str, sql_value
 
-_BINARY_OPERATORS: dict[FilterOperator, str] = {
+_COMPARISONS: dict[FilterOperator, str] = {
     FilterOperator.EQ: "=",
     FilterOperator.NE: "!=",
     FilterOperator.GT: ">",
@@ -26,25 +27,27 @@ _BINARY_OPERATORS: dict[FilterOperator, str] = {
     FilterOperator.LTE: "<=",
 }
 
-_CONDITION_JOIN: dict[FilterCondition, str] = {
-    FilterCondition.AND: " AND ",
-    FilterCondition.OR: " OR ",
-}
+_ARRAY_OPERATORS = frozenset({FilterOperator.CONTAINS, FilterOperator.ANY, FilterOperator.ALL})
 
 
-def compile_filters(filters: MetadataFilters, allowed: Iterable[str]) -> str:
-    """Render a ``MetadataFilters`` tree as a SQL predicate string."""
-    return _compile_group(filters, set(allowed))
+def compile_filters(filters: MetadataFilters, columns: Mapping[str, pa.DataType]) -> str:
+    """Render a filter tree as a SQL predicate over ``columns`` (name to Arrow type).
 
-
-def _compile_group(group: MetadataFilters, allowed: set[str]) -> str:
-    parts = [_compile_node(child, allowed) for child in group.filters]
+    Raises ``ValueError`` for an undeclared key or an operator the column's
+    type does not support.
+    """
+    parts = [
+        compile_filters(child, columns)
+        if isinstance(child, MetadataFilters)
+        else _compile_filter(child, columns)
+        for child in filters.filters
+    ]
     if not parts:
         return "TRUE"
-    condition = group.condition or FilterCondition.AND
+    condition = filters.condition or FilterCondition.AND
     if condition == FilterCondition.NOT:
         return f"NOT ({_join(' AND ', parts)})"
-    return _join(_CONDITION_JOIN[condition], parts)
+    return _join(" OR " if condition == FilterCondition.OR else " AND ", parts)
 
 
 def _join(joiner: str, parts: list[str]) -> str:
@@ -53,62 +56,53 @@ def _join(joiner: str, parts: list[str]) -> str:
     return joiner.join(f"({p})" for p in parts)
 
 
-def _compile_node(
-    child: MetadataFilter | MetadataFilters,
-    allowed: set[str],
-) -> str:
-    if isinstance(child, MetadataFilters):
-        return _compile_group(child, allowed)
-    if child.key not in allowed:
+def _compile_filter(f: MetadataFilter, columns: Mapping[str, pa.DataType]) -> str:
+    if f.key not in columns:
         raise ValueError(
-            f"cannot filter on {child.key!r}: not a declared metadata column "
-            f"(declared: {sorted(allowed)})"
+            f"cannot filter on {f.key!r}: not a declared metadata column "
+            f"(declared: {sorted(columns)})"
         )
-    return _compile_comparison(child)
-
-
-def _compile_comparison(f: MetadataFilter) -> str:
     op = f.operator
-    key = f.key
-    value = f.value
+    key = quote_ident(f.key)
+    is_list = pa.types.is_list(columns[f.key]) or pa.types.is_large_list(columns[f.key])
 
-    if op in _BINARY_OPERATORS:
-        return f"{key} {_BINARY_OPERATORS[op]} {sql_value(value)}"
-    if op in (FilterOperator.IN, FilterOperator.ANY):
-        items = ", ".join(sql_value(v) for v in _as_list(value))
-        return f"{key} IN ({items})"
-    if op == FilterOperator.NIN:
-        items = ", ".join(sql_value(v) for v in _as_list(value))
-        return f"{key} NOT IN ({items})"
-    if op == FilterOperator.ALL:
-        parts = [f"{key} = {sql_value(v)}" for v in _as_list(value)]
-        return " AND ".join(parts) if parts else "TRUE"
-    if op in (FilterOperator.CONTAINS, FilterOperator.TEXT_MATCH):
-        return _like(key, _as_str(value), case_sensitive=True)
-    if op == FilterOperator.TEXT_MATCH_INSENSITIVE:
-        return _like(key, _as_str(value), case_sensitive=False)
     if op == FilterOperator.IS_EMPTY:
-        return f"({key} IS NULL OR {key} = '')"
-    raise ValueError(f"unsupported filter operator: {op}")
+        return f"({key} IS NULL OR cardinality({key}) = 0)" if is_list else f"{key} IS NULL"
+    if op in _ARRAY_OPERATORS:
+        if not is_list:
+            raise ValueError(f"{op.name} needs a list column; {f.key!r} is {columns[f.key]}")
+        if op == FilterOperator.CONTAINS:
+            return f"array_has({key}, {sql_value(f.value)})"
+        items = _as_list(f.value)
+        if not items:
+            return "FALSE" if op == FilterOperator.ANY else "TRUE"
+        function = "array_has_any" if op == FilterOperator.ANY else "array_has_all"
+        return f"{function}({key}, [{', '.join(sql_value(v) for v in items)}])"
+    if is_list:
+        raise ValueError(f"{op.name} does not apply to list column {f.key!r}")
+    if op in _COMPARISONS:
+        return f"{key} {_COMPARISONS[op]} {sql_value(f.value)}"
+    if op in (FilterOperator.IN, FilterOperator.NIN):
+        items = _as_list(f.value)
+        if not items:
+            return "FALSE" if op == FilterOperator.IN else "TRUE"
+        negate = "NOT " if op == FilterOperator.NIN else ""
+        return f"{key} {negate}IN ({', '.join(sql_value(v) for v in items)})"
+    if op == FilterOperator.TEXT_MATCH:
+        return _like(key, f.value, "LIKE")
+    if op == FilterOperator.TEXT_MATCH_INSENSITIVE:
+        return _like(key, f.value, "ILIKE")
+    raise ValueError(f"unsupported filter operator: {op.name}")
 
 
-def _like(key: str, value: str, *, case_sensitive: bool) -> str:
-    pattern = "%" + _escape_like(value) + "%"
-    op = "LIKE" if case_sensitive else "ILIKE"
-    return f"{key} {op} {quote_str(pattern)} ESCAPE '\\'"
-
-
-def _escape_like(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+def _like(key: str, value: object, operator: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"expected a string value, got {type(value).__name__}")
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{key} {operator} {quote_str('%' + escaped + '%')} ESCAPE '\\'"
 
 
 def _as_list(value: object) -> list[object]:
     if not isinstance(value, (list, tuple)):
         raise TypeError(f"expected a list value, got {type(value).__name__}")
     return list(value)
-
-
-def _as_str(value: object) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"expected a string value, got {type(value).__name__}")
-    return value

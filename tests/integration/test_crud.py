@@ -91,11 +91,67 @@ def test_optimize_and_gc_are_callable(store, seeded_nodes):
     assert store.count() == len(seeded_nodes)
 
 
-def test_from_params_opens_or_creates(tmp_connection):
-    store = InfinoVectorStore.from_params(tmp_connection, "params", dim=DIM)
-    ids = store.add([make_node("x", id_="p1", embedding=vec(0.2))])
-    assert ids == ["p1"]
+def test_table_name_needing_quotes_works(tmp_connection):
+    store = InfinoVectorStore(tmp_connection, "my-docs", dim=DIM)
+    store.add([make_node("x", id_="p1", embedding=vec(0.2))])
+    assert [n.node_id for n in store.get_nodes(node_ids=["p1"])] == ["p1"]
     assert store.count() == 1
+
+
+def test_add_rejects_repeated_node_id(store):
+    node = make_node("x", id_="dup", embedding=vec(0.2))
+    with pytest.raises(ValueError, match="more than once"):
+        store.add([node, node])
+
+
+def test_empty_node_ids_match_nothing(store, seeded_nodes):
+    store.add(seeded_nodes)
+    assert store.get_nodes(node_ids=[]) == []
+    store.delete_nodes(
+        node_ids=[], filters=MetadataFilters(filters=[MetadataFilter(key="category", value="tech")])
+    )
+    assert store.count() == len(seeded_nodes)
+
+
+@pytest.mark.parametrize("name", ["text", "score"])
+def test_metadata_column_cannot_shadow_a_store_column(tmp_connection, name):
+    with pytest.raises(ValueError, match="distinct"):
+        InfinoVectorStore(
+            tmp_connection, "clash", dim=DIM, metadata_columns=[pa.field(name, pa.large_utf8())]
+        )
+
+
+def test_list_metadata_column_filters(tmp_connection):
+    store = InfinoVectorStore(
+        tmp_connection,
+        "tagged",
+        dim=DIM,
+        metadata_columns=[pa.field("tags", pa.list_(pa.large_utf8()), nullable=True)],
+    )
+    store.add(
+        [
+            make_node("a", id_="t1", embedding=vec(0.1), metadata={"tags": ["x", "y"]}),
+            make_node("b", id_="t2", embedding=vec(0.2), metadata={"tags": ["y"]}),
+            make_node("c", id_="t3", embedding=vec(0.3), metadata={"tags": []}),
+        ]
+    )
+
+    def ids(op, value):
+        f = MetadataFilters(filters=[MetadataFilter(key="tags", value=value, operator=op)])
+        return sorted(n.node_id for n in store.get_nodes(filters=f))
+
+    assert ids(FilterOperator.CONTAINS, "x") == ["t1"]
+    assert ids(FilterOperator.ANY, ["x", "y"]) == ["t1", "t2"]
+    assert ids(FilterOperator.ALL, ["x", "y"]) == ["t1"]
+    assert ids(FilterOperator.IS_EMPTY, None) == ["t3"]
+
+
+def test_is_empty_on_numeric_column(store, seeded_nodes):
+    store.add([*seeded_nodes, make_node("undated", id_="n5", embedding=vec(0.9))])
+    f = MetadataFilters(
+        filters=[MetadataFilter(key="year", value=None, operator=FilterOperator.IS_EMPTY)]
+    )
+    assert [n.node_id for n in store.get_nodes(filters=f)] == ["n5"]
 
 
 def test_memory_connection_cannot_mutate():

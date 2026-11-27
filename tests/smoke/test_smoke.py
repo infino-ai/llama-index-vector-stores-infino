@@ -13,7 +13,7 @@ DIM = 16
 
 def test_round_trip(tmp_path) -> None:
     connection = infino.connect(str(tmp_path / "db"))
-    store = InfinoVectorStore.from_params(connection, "smoke", dim=DIM)
+    store = InfinoVectorStore(connection, "smoke", dim=DIM)
     node = TextNode(text="hello infino", id_="n", embedding=[0.1] * DIM)
     store.add([node])
     result = store.query(VectorStoreQuery(query_embedding=[0.1] * DIM, similarity_top_k=1))
