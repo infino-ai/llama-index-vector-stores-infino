@@ -35,7 +35,6 @@ dependencies = [
     "llama-index-core>=0.13,<0.15",
     "infino>=0.13,<0.14",
     "pyarrow>=14",
-    "numpy>=1.26",
 ]
 
 [project.urls]
